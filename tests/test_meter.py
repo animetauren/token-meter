@@ -16021,7 +16021,9 @@ class PiSubagentTests(unittest.TestCase):
                     "probe?x=1", "models/llama-3.gguf",
                     "Users/henry/.ssh/id_rsa", "a/../../etc/passwd",
                     "example.com/secret", "localhost:8080/model",
-                    "home/henry/model", "C:/Users/henry/model"):
+                    "home/henry/model", "C:/Users/henry/model",
+                    "example.com:8080/secret", "127.0.0.1:8000/model",
+                    "my-server.internal:8000/model", "10.0.0.5:9000/model"):
             with self.subTest(model=bad), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp) / "agent"
                 self._write_subagent_session(root, results=[

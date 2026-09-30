@@ -159,7 +159,7 @@ def _model_id_is_path_like(text):
     segments = text.split("/")
     if len(segments) > 1:
         first = segments[0].lower()
-        if re.fullmatch(r"[a-z0-9-]+(?::\d+)?(?:\.[a-z0-9-]+)+", first):
+        if re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+(?::\d+)?", first):
             # Host-shaped namespace such as example.com/secret.
             return True
         if first.split(":", 1)[0] in _MODEL_PATH_ROOT_SEGMENTS:
