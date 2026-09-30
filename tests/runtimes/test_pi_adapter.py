@@ -96,11 +96,10 @@ class PiRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(loaded.turns, ())
 
     def test_native_load_includes_child_spend_without_child_content(self):
+        # The shipped subagent tool reports cost as a scalar.
         child = {
             "input": 500, "output": 50, "cacheRead": 0, "cacheWrite": 0,
-            "cost": {"input": 0.2, "output": 0.0, "cacheRead": 0.0,
-                     "cacheWrite": 0.0},
-            "turns": 1,
+            "cost": 0.25, "turns": 1,
         }
         with tempfile.TemporaryDirectory() as tmp:
             self._write_session(tmp, child_usage=child)
@@ -110,7 +109,7 @@ class PiRuntimeAdapterTests(unittest.TestCase):
 
         self.assertEqual(loaded.usage.input_tokens.value, 600)
         self.assertEqual(loaded.usage.output_tokens.value, 70)
-        self.assertAlmostEqual(loaded.usage.cost_usd.value, 0.2033)
+        self.assertAlmostEqual(loaded.usage.cost_usd.value, 0.2533)
         encoded = repr(loaded)
         self.assertNotIn("CHILD-TASK-CANARY", encoded)
         self.assertNotIn("CHILD-MESSAGE-CANARY", encoded)

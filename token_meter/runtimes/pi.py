@@ -30,6 +30,7 @@ from token_meter.contracts import (
     UsageEvidence,
 )
 from token_meter.domain.timing import merge_execution_intervals, performance_summary
+from token_meter.domain.usage import distribute_reported_cost_counts
 
 
 MAX_JSON_BYTES = 32 * 1024 * 1024
@@ -148,6 +149,7 @@ def _subagent_model_id(value):
     if not isinstance(value, str):
         return ""
     text = value.strip()
+    lowered = text.lower()
     if (
         not text or len(text) > 120
         or any(char.isspace() for char in text)
@@ -155,6 +157,11 @@ def _subagent_model_id(value):
         or "://" in text
         or text.startswith(("/", "\\", "~", "./", "../"))
         or re.match(r"^[A-Za-z]:[\\/]", text)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/@:+-]*", text)
+        or lowered.startswith(("bearer ", "sk-", "-----begin "))
+        or any(marker in lowered for marker in (
+            "api_key=", "api-key=", "secret=", "token=",
+        ))
     ):
         return ""
     return text
@@ -184,7 +191,34 @@ def _subagent_usage(value):
     cache_write = _integer(value.get("cacheWrite"))
     reasoning = _integer(value.get("reasoning")) or 0
     reasoning = min(reasoning, output_tokens) if output_tokens is not None else 0
-    breakdown = _cost_breakdown(value.get("cost"))
+    raw_cost = value.get("cost")
+    breakdown = _cost_breakdown(raw_cost)
+    scalar_cost = _number(raw_cost)
+    if scalar_cost is None and isinstance(raw_cost, dict):
+        scalar_cost = _number(raw_cost.get("total"))
+    if breakdown is not None:
+        total_cost = sum(breakdown.values())
+    elif scalar_cost is not None:
+        # The shipped subagent tool reports a scalar cost. Allocate it across
+        # the token buckets the way the provider-reported-cost helper does for
+        # other scalar-cost runtimes, so the breakdown still sums to the total.
+        distributed = distribute_reported_cost_counts(
+            scalar_cost,
+            input_tokens=input_tokens or 0,
+            output_tokens=output_tokens or 0,
+            cache_read_tokens=cache_read or 0,
+            cache_write_tokens=cache_write or 0,
+            reasoning_tokens=reasoning,
+        )
+        breakdown = {
+            "input": distributed["input"],
+            "cache_write": distributed["cache_write"],
+            "cache_read": distributed["cache_read"],
+            "output": distributed["output"] + distributed["reasoning"],
+        }
+        total_cost = scalar_cost
+    else:
+        total_cost = 0.0
     input_available = input_tokens is not None
     output_available = output_tokens is not None
     cache_available = cache_read is not None and cache_write is not None
@@ -203,7 +237,7 @@ def _subagent_usage(value):
         "cache_available": cache_available,
         "cost_available": breakdown is not None,
         "cost": breakdown,
-        "total_cost": sum(breakdown.values()) if breakdown else 0.0,
+        "total_cost": total_cost,
         "turns": _integer(value.get("turns")),
     }
 
@@ -694,6 +728,7 @@ class PiRuntimeAdapter:
                 turns.append({
                     "index": len(turns) + 1, "start": start, "end": max(start, end),
                     "model": model_ref_for(provider, model).model_id,
+                    "stop_reason": _subagent_stop_reason(message.get("stopReason")),
                     "input_tokens": input_tokens or 0,
                     "output_tokens": output_tokens or 0,
                     "reasoning_tokens": reasoning_tokens,
@@ -1133,6 +1168,9 @@ class PiRuntimeAdapter:
             "tokens_available": own_tokens_available,
             "model": primary_own_model,
             "executions": len(turns),
+            "terminal": bool(
+                turns and turns[-1]["stop_reason"] == "stop"
+            ),
             "started_at": own_start or None,
             "last_activity_at": own_end or None,
             "work_time_s": own_active,
@@ -1192,6 +1230,7 @@ class PiRuntimeAdapter:
             own.get("last_activity_at") or float(source.get("mtime") or 0) or None
         )
         own_model = own.get("model") or "unknown-model"
+        terminal = bool(own.get("terminal"))
         records = [{
             "id": root_id,
             "parent_id": None,
@@ -1204,11 +1243,12 @@ class PiRuntimeAdapter:
             "role": None,
             "model": own_model,
             "activity_state": (
-                "working" if root_last and now - float(root_last) <= 90
+                "complete" if terminal
+                else "working" if root_last and now - float(root_last) <= 90
                 else "incomplete"
             ),
             "started_at": own.get("started_at"),
-            "ended_at": None,
+            "ended_at": own.get("last_activity_at") if terminal else None,
             "last_activity_at": root_last,
             "input_tokens": own.get("input_tokens") or 0,
             "output_tokens": own.get("output_tokens") or 0,

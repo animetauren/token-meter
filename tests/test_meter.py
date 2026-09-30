@@ -15508,19 +15508,24 @@ class PiSubagentTests(unittest.TestCase):
 
     @staticmethod
     def _child_usage(input_tokens=1000, output_tokens=100, cache_read=0,
-                     cache_write=0, cost=0.25, turns=2):
-        return {
+                     cache_write=0, cost=0.25, turns=2, breakdown=False):
+        # The shipped subagent tool reports a scalar cost, so that is the
+        # default shape; breakdown=True is the documented Pi Usage object.
+        usage = {
             "input": input_tokens,
             "output": output_tokens,
             "cacheRead": cache_read,
             "cacheWrite": cache_write,
-            "cost": {
-                "input": cost, "output": 0, "cacheRead": 0,
-                "cacheWrite": 0, "total": cost,
-            },
+            "cost": cost,
             "contextTokens": input_tokens + cache_read + cache_write,
             "turns": turns,
         }
+        if breakdown:
+            usage["cost"] = {
+                "input": cost, "output": 0.0, "cacheRead": 0.0,
+                "cacheWrite": 0.0, "total": cost,
+            }
+        return usage
 
     def _child_result(self, agent="probe", *, usage=None, exit_code=0,
                       stop_reason="stop", model="opencode-go/deepseek-v4.1-flash",
@@ -15547,32 +15552,52 @@ class PiSubagentTests(unittest.TestCase):
     def _write_subagent_session(self, agent_root, *, results=None,
                                 top_usage=None, include_result=True,
                                 arguments=None, tool_name="subagent",
-                                mode="single"):
+                                mode="single", recent_seconds=None,
+                                stop_reason="stop"):
         directory = Path(agent_root) / "sessions" / "--repo--"
         directory.mkdir(parents=True)
         path = directory / "pi-subagent-session.jsonl"
+        if recent_seconds is None:
+            stamps = [
+                "2026-09-04T10:00:00Z", "2026-09-04T10:00:01Z",
+                "2026-09-04T10:00:02Z", "2026-09-04T10:00:05Z",
+                "2026-09-04T10:00:09Z",
+            ]
+        else:
+            base = (
+                datetime.datetime.now(datetime.timezone.utc)
+                - datetime.timedelta(seconds=recent_seconds)
+            )
+            stamps = [
+                (base + datetime.timedelta(seconds=offset)).isoformat()
+                .replace("+00:00", "Z")
+                for offset in (0, 1, 2, 5, 9)
+            ]
         tool_call = {
             "type": "toolCall", "id": "call-subagent", "name": tool_name,
             "arguments": arguments or {"agent": "probe", "task": self.CONTENT_CANARY},
         }
+        assistant_message = {
+            "role": "assistant", "model": "claude-test", "provider": "anthropic",
+            "content": [tool_call],
+            "usage": {"input": 100, "output": 20, "cacheRead": 10,
+                      "cacheWrite": 5, "totalTokens": 135,
+                      "cost": {"input": 0.001, "output": 0.002,
+                               "cacheRead": 0.0001, "cacheWrite": 0.0002}},
+        }
+        if stop_reason is not None:
+            assistant_message["stopReason"] = stop_reason
         rows = [
             {"type": "session", "version": 3, "id": "pi-session",
-             "timestamp": "2026-09-04T10:00:00Z", "cwd": "/repo"},
+             "timestamp": stamps[0], "cwd": "/repo"},
             {"type": "model_change", "id": "model-change", "parentId": None,
-             "timestamp": "2026-09-04T10:00:01Z", "provider": "anthropic",
+             "timestamp": stamps[1], "provider": "anthropic",
              "modelId": "claude-test"},
             {"type": "message", "id": "user", "parentId": "model-change",
-             "timestamp": "2026-09-04T10:00:02Z",
+             "timestamp": stamps[2],
              "message": {"role": "user", "content": []}},
             {"type": "message", "id": "assistant", "parentId": "user",
-             "timestamp": "2026-09-04T10:00:05Z", "message": {
-                "role": "assistant", "model": "claude-test", "provider": "anthropic",
-                "content": [tool_call],
-                "usage": {"input": 100, "output": 20, "cacheRead": 10,
-                          "cacheWrite": 5, "totalTokens": 135,
-                          "cost": {"input": 0.001, "output": 0.002,
-                                   "cacheRead": 0.0001, "cacheWrite": 0.0002}},
-            }},
+             "timestamp": stamps[3], "message": assistant_message},
         ]
         if include_result:
             message = {
@@ -15588,7 +15613,7 @@ class PiSubagentTests(unittest.TestCase):
                 message["usage"] = top_usage
             rows.append({
                 "type": "message", "id": "result", "parentId": "assistant",
-                "timestamp": "2026-09-04T10:00:09Z", "message": message,
+                "timestamp": stamps[4], "message": message,
             })
         path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
         return path
@@ -15650,6 +15675,44 @@ class PiSubagentTests(unittest.TestCase):
             root_record["cost"] + child["cost"], state["total_cost"], places=9,
         )
 
+    def test_shipped_extension_scalar_cost_shape_is_measured(self):
+        for reported in (0.0, 0.42):
+            with self.subTest(cost=reported), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "agent"
+                # Exact usage shape persisted by the shipped subagent example.
+                usage = {
+                    "input": 1461, "output": 27, "cacheRead": 0,
+                    "cacheWrite": 0, "cost": reported,
+                    "contextTokens": 1488, "turns": 1,
+                }
+                self._write_subagent_session(
+                    root, results=[self._child_result(usage=usage)],
+                )
+                _source, state, summary = self._load(root)
+
+                child = self._records(summary)["spawned"]
+                self.assertTrue(child["cost_available"])
+                self.assertEqual(child["cost"], reported)
+                self.assertTrue(state["availability"]["cost"])
+                self.assertAlmostEqual(
+                    state["total_cost"], 0.0033 + reported, places=6,
+                )
+
+    def test_reported_cost_breakdown_shape_is_still_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(root, results=[
+                self._child_result(
+                    usage=self._child_usage(cost=0.25, breakdown=True),
+                ),
+            ])
+            _source, state, summary = self._load(root)
+
+        child = self._records(summary)["spawned"]
+        self.assertTrue(child["cost_available"])
+        self.assertAlmostEqual(child["cost"], 0.25)
+        self.assertAlmostEqual(state["total_cost"], 0.2533)
+
     def test_parallel_child_results_each_emit_a_record_and_sum_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "agent"
@@ -15687,6 +15750,20 @@ class PiSubagentTests(unittest.TestCase):
         self.assertEqual(children[0]["role"], "probe")
         self.assertEqual(children[0]["tokens"], 550)
         self.assertAlmostEqual(children[0]["cost"], 0.3)
+        self.assertEqual(state["total_tokens"], 685)
+
+    def test_top_level_breakdown_usage_emits_aggregate_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(
+                root, results=[],
+                top_usage=self._child_usage(500, 50, cost=0.3, breakdown=True),
+            )
+            _source, state, summary = self._load(root)
+
+        child = self._records(summary)["spawned"]
+        self.assertTrue(child["cost_available"])
+        self.assertAlmostEqual(child["cost"], 0.3)
         self.assertEqual(state["total_tokens"], 685)
 
     def test_reconciling_details_and_top_level_usage_count_spend_once(self):
@@ -15813,10 +15890,50 @@ class PiSubagentTests(unittest.TestCase):
 
         child = self._records(summary)["spawned"]
         self.assertEqual(child["activity_state"], "incomplete")
+        self.assertEqual(child["failed_attempts"], 0)
         self.assertFalse(child["tokens_available"])
         self.assertFalse(child["cost_available"])
         self.assertEqual(state["total_tokens"], 135)
         self.assertEqual(state["total_cost"], 0.0033)
+
+    def test_fresh_unfinished_child_call_is_working(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(
+                root, include_result=False, recent_seconds=10,
+            )
+            _source, _state, summary = self._load(root)
+
+        child = self._records(summary)["spawned"]
+        self.assertEqual(child["activity_state"], "working")
+        self.assertEqual(child["failed_attempts"], 0)
+
+    def test_finished_session_root_reports_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(
+                root, results=[self._child_result(usage=self._child_usage())],
+            )
+            _source, _state, summary = self._load(root)
+
+        root_record = self._records(summary)["root"]
+        self.assertEqual(root_record["activity_state"], "complete")
+        self.assertEqual(
+            root_record["ended_at"], root_record["last_activity_at"],
+        )
+
+    def test_nonterminal_session_root_stays_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(
+                root, stop_reason=None,
+                results=[self._child_result(usage=self._child_usage())],
+            )
+            _source, _state, summary = self._load(root)
+
+        root_record = self._records(summary)["root"]
+        self.assertEqual(root_record["activity_state"], "incomplete")
+        self.assertIsNone(root_record["ended_at"])
 
     def test_empty_results_run_emits_no_agent_records(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -15848,6 +15965,24 @@ class PiSubagentTests(unittest.TestCase):
                 encoded = json.dumps({"summary": summary, "state": state})
                 self.assertNotIn(bad, encoded)
 
+    def test_child_model_rejects_credential_and_path_shapes(self):
+        for bad in ("sk-secret-value", "bearer abc", "/Users/henry/model",
+                    "https://example.test/model", "model with space",
+                    "probe?x=1"):
+            with self.subTest(model=bad), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "agent"
+                self._write_subagent_session(root, results=[
+                    self._child_result(
+                        usage=self._child_usage(), model=bad,
+                    ),
+                ])
+                _source, state, summary = self._load(root)
+
+                child = self._records(summary)["spawned"]
+                self.assertEqual(child["model"], "claude-test")
+                encoded = json.dumps({"summary": summary, "state": state})
+                self.assertNotIn(bad, encoded)
+
     def test_child_content_never_reaches_summary_state_or_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "agent"
@@ -15856,6 +15991,8 @@ class PiSubagentTests(unittest.TestCase):
             )
             _source, state, summary = self._load(root)
 
+        # The records must exist for this to be a meaningful negative check.
+        self.assertTrue(summary.get("_agent_records"))
         encoded = json.dumps({"summary": summary, "state": state})
         self.assertNotIn(self.CONTENT_CANARY, encoded)
         self.assertNotIn("stderr", encoded)
@@ -15874,14 +16011,18 @@ class PiSubagentTests(unittest.TestCase):
         self.assertEqual(state["total_tokens"], 135)
         self.assertNotIn("_agent_records", summary)
 
-    def test_canonical_agent_sources_selects_pi_rows_once(self):
+    def test_canonical_agent_sources_selects_pi_rows(self):
         source = {
             "id": "pi-session", "path": "/tmp/pi.jsonl", "provider": "pi",
             "runtime": "Pi", "label": "Pi", "project": "/repo", "mtime": 1,
         }
-        selected = meter.canonical_agent_sources([source, dict(source)])
-        self.assertEqual(len(selected), 2)
-        self.assertTrue(all(row["provider"] == "pi" for row in selected))
+        other = {
+            "id": "kiro-session", "path": "/tmp/kiro.json",
+            "provider": "kiro", "runtime": "Kiro", "label": "Kiro",
+            "project": "/repo", "mtime": 1,
+        }
+        selected = meter.canonical_agent_sources([source, other])
+        self.assertEqual(selected, [source])
 
     def test_agent_group_and_inventory_include_pi_children(self):
         with tempfile.TemporaryDirectory() as tmp:
