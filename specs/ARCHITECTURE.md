@@ -140,9 +140,10 @@ exactly; otherwise one aggregate run carries the total. A run without usage
 evidence reports unavailable tokens and cost and makes the session coverage
 partial rather than folding an unknown into a complete total. A child whose
 model is unreported or fails sanitization is attributed to an explicit
-`unknown-model` key, never to the parent's model. A Pi session is terminal when
-its final assistant turn stopped normally, matching how other runtimes derive
-liveness from recorded stop evidence.
+`unknown-model` key, never to the parent's model. A root agent record derives
+its own completion from the final assistant turn's recorded stop reason, while
+the session summary row keeps its pre-existing nonterminal behavior so sessions
+without subagent calls do not change.
 
 ## Domain and Model Flow
 

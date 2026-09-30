@@ -15926,14 +15926,15 @@ class PiSubagentTests(unittest.TestCase):
             )
             _source, _state, summary = self._load(root)
 
-        self.assertTrue(summary["terminal"])
+        # Session-row liveness is intentionally unchanged for this PR.
+        self.assertFalse(summary["terminal"])
         root_record = self._records(summary)["root"]
         self.assertEqual(root_record["activity_state"], "complete")
         self.assertEqual(
             root_record["ended_at"], root_record["last_activity_at"],
         )
 
-    def test_realistic_tool_use_then_stop_marks_session_terminal(self):
+    def test_realistic_tool_use_then_stop_marks_root_complete(self):
         final_usage = {
             "input": 50, "output": 10, "cacheRead": 0, "cacheWrite": 0,
             "totalTokens": 60,
@@ -15949,7 +15950,6 @@ class PiSubagentTests(unittest.TestCase):
             )
             _source, state, summary = self._load(root)
 
-        self.assertTrue(summary["terminal"])
         self.assertEqual(summary["turns"], 2)
         self.assertEqual(
             self._records(summary)["root"]["activity_state"], "complete",
@@ -16076,6 +16076,8 @@ class PiSubagentTests(unittest.TestCase):
 
         self.assertEqual(state["total_tokens"], 135)
         self.assertNotIn("_agent_records", summary)
+        # A non-subagent Pi session keeps its pre-existing session liveness.
+        self.assertFalse(summary["terminal"])
 
     def test_canonical_agent_sources_selects_pi_rows(self):
         source = {

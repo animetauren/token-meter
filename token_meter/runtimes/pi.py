@@ -1209,7 +1209,10 @@ class PiRuntimeAdapter:
             "window": None, "latest_pct": None, "estimated": False,
         }
         row["_context_samples"] = context_samples[-compat["context_sample_limit"]:]
-        row["terminal"] = own_terminal
+        # Session-row liveness keeps the pre-existing nonterminal behavior so
+        # sessions without subagent calls are unchanged. Agent records use the
+        # recorded stop reason for their own lifecycle state.
+        row["terminal"] = False
         row["_tool_evidence"] = compat["summarize_tool_evidence"](tool_calls)
         if agent_records:
             row["_agent_records"] = list(agent_records)
