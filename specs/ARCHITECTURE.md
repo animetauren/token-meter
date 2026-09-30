@@ -151,6 +151,20 @@ catalog data; it should not require a runtime adapter or client change. Longest
 valid prefix matching and historical price boundaries are compatibility
 contracts.
 
+Matched-pace comparison is per model-runtime pair. Each pair compares its two
+completed-turn histories in full, so its cost grows with the product of the two
+sample counts and a single long history can dominate cross-session aggregation.
+Comparisons are therefore cached per pair, keyed by a digest of each side's
+samples, so a new turn for one model rebuilds only the pairs that model takes
+part in. The pair cache is also written to the Token Meter state directory and
+reloaded on start, so a restart reuses unchanged pairs instead of rebuilding
+every pair. Only model and runtime identifiers and aggregate duration, token,
+ratio, and coverage values are stored; the file carries no prompt, response,
+tool, path, or raw trace content. Persistence is enabled only by the server
+entrypoint, so importing the module never writes the user's cache. A rebuild
+runs outside the cache lock and is single-flighted, so one slow rebuild neither
+blocks requests that already have fresh data nor runs concurrently with itself.
+
 ## Application State and Caching
 
 `token_meter/app.py` composes runtime, quota, and platform registries and owns
