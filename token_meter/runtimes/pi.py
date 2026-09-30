@@ -981,6 +981,7 @@ class PiRuntimeAdapter:
                     "timing_basis": "inferred",
                 })
         primary_model = max(model_tok, key=model_tok.get) if model_tok else source.get("model")
+        own_output = tot["output"]
         nested = _nested_usage_totals(runs)
         for run in runs:
             usage = run.get("usage")
@@ -1012,7 +1013,7 @@ class PiRuntimeAdapter:
         active = merge_execution_intervals(intervals)
         source = dict(source)
         source["context_latest"] = executions[-1]["context_tokens"] if executions else 0
-        throughput = performance_summary(wait_samples, tot["output"])
+        throughput = performance_summary(wait_samples, own_output)
         context_available = bool(turns) and all(turn["context_available"] for turn in turns)
         availability = compat["metric_availability"](
             "pi", cost=all_cost_available, tokens=all_tokens_available,
@@ -1175,7 +1176,9 @@ class PiRuntimeAdapter:
             "last_activity_at": own_end or None,
             "work_time_s": own_active,
         })
-        throughput = performance_summary(wait_samples, output_tokens)
+        # Session pace diagnostics cover parent model calls only, so the
+        # coverage denominator must not grow with nested child output.
+        throughput = performance_summary(wait_samples, own_output_tokens)
         availability = compat["metric_availability"](
             "pi", cost=all_cost_available, tokens=all_tokens_available,
             input_tokens=all_tokens_available, output_tokens=all_tokens_available,
@@ -1204,6 +1207,9 @@ class PiRuntimeAdapter:
             max(own_model_tok, key=own_model_tok.get) if own_model_tok
             else source.get("model")
         )
+        # summary_row recomputes throughput from the full token total, which
+        # now includes child output; restore the parent-scoped value.
+        row["throughput"] = throughput
         row["context"] = {
             "latest": context_samples[-1] if context_samples else 0,
             "window": None, "latest_pct": None, "estimated": False,

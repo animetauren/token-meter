@@ -15723,6 +15723,21 @@ class PiSubagentTests(unittest.TestCase):
         self.assertAlmostEqual(child["cost"], 0.25)
         self.assertAlmostEqual(state["total_cost"], 0.2533)
 
+    def test_child_output_does_not_change_parent_pace_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(
+                root, results=[self._child_result(usage=self._child_usage())],
+            )
+            _source, state, summary = self._load(root)
+
+        self.assertTrue(summary["throughput"]["available"])
+        self.assertAlmostEqual(
+            summary["throughput"]["timing_coverage"], 1.0,
+        )
+        self.assertAlmostEqual(summary["throughput"]["output_tps"], 20 / 3)
+        self.assertAlmostEqual(state["throughput"]["timing_coverage"], 1.0)
+
     def test_parallel_child_results_each_emit_a_record_and_sum_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "agent"

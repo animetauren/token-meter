@@ -72,7 +72,9 @@ and are never read by the adapter.
    totals, model statistics, and daily cost, and therefore to global totals,
    budgets, and the menu bar. It is not added to the parent's execution list,
    wait samples, or active-time intervals; child work is not a parent model
-   call.
+   call. Session pace diagnostics therefore keep the parent output
+   denominator, so throughput coverage is unchanged for the parent's model
+   calls, and child wall time is reported on the agent record.
 5. **Root invariant.** A session with at least one child run emits one `root`
    agent record whose metrics exclude nested spend, so root plus children equal
    the session headline exactly.
