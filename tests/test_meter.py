@@ -15501,6 +15501,411 @@ class PiRuntimeTests(unittest.TestCase):
         self.assertEqual(state["total_cost"], 0)
 
 
+class PiSubagentTests(unittest.TestCase):
+    """Pi child runs live inside the parent transcript and must be accounted."""
+
+    CONTENT_CANARY = "PI-CONTENT-CANARY-7731"
+
+    @staticmethod
+    def _child_usage(input_tokens=1000, output_tokens=100, cache_read=0,
+                     cache_write=0, cost=0.25, turns=2):
+        return {
+            "input": input_tokens,
+            "output": output_tokens,
+            "cacheRead": cache_read,
+            "cacheWrite": cache_write,
+            "cost": {
+                "input": cost, "output": 0, "cacheRead": 0,
+                "cacheWrite": 0, "total": cost,
+            },
+            "contextTokens": input_tokens + cache_read + cache_write,
+            "turns": turns,
+        }
+
+    def _child_result(self, agent="probe", *, usage=None, exit_code=0,
+                      stop_reason="stop", model="opencode-go/deepseek-v4.1-flash",
+                      step=None):
+        result = {
+            "agent": agent,
+            "agentSource": "user",
+            "task": self.CONTENT_CANARY + "-task",
+            "exitCode": exit_code,
+            "messages": [{
+                "role": "assistant",
+                "content": [{"type": "text", "text": self.CONTENT_CANARY}],
+            }],
+            "stderr": self.CONTENT_CANARY + "-stderr",
+            "stopReason": stop_reason,
+            "model": model,
+        }
+        if usage is not None:
+            result["usage"] = usage
+        if step is not None:
+            result["step"] = step
+        return result
+
+    def _write_subagent_session(self, agent_root, *, results=None,
+                                top_usage=None, include_result=True,
+                                arguments=None, tool_name="subagent",
+                                mode="single"):
+        directory = Path(agent_root) / "sessions" / "--repo--"
+        directory.mkdir(parents=True)
+        path = directory / "pi-subagent-session.jsonl"
+        tool_call = {
+            "type": "toolCall", "id": "call-subagent", "name": tool_name,
+            "arguments": arguments or {"agent": "probe", "task": self.CONTENT_CANARY},
+        }
+        rows = [
+            {"type": "session", "version": 3, "id": "pi-session",
+             "timestamp": "2026-09-04T10:00:00Z", "cwd": "/repo"},
+            {"type": "model_change", "id": "model-change", "parentId": None,
+             "timestamp": "2026-09-04T10:00:01Z", "provider": "anthropic",
+             "modelId": "claude-test"},
+            {"type": "message", "id": "user", "parentId": "model-change",
+             "timestamp": "2026-09-04T10:00:02Z",
+             "message": {"role": "user", "content": []}},
+            {"type": "message", "id": "assistant", "parentId": "user",
+             "timestamp": "2026-09-04T10:00:05Z", "message": {
+                "role": "assistant", "model": "claude-test", "provider": "anthropic",
+                "content": [tool_call],
+                "usage": {"input": 100, "output": 20, "cacheRead": 10,
+                          "cacheWrite": 5, "totalTokens": 135,
+                          "cost": {"input": 0.001, "output": 0.002,
+                                   "cacheRead": 0.0001, "cacheWrite": 0.0002}},
+            }},
+        ]
+        if include_result:
+            message = {
+                "role": "toolResult", "toolCallId": "call-subagent",
+                "toolName": tool_name,
+                "content": [{"type": "text", "text": self.CONTENT_CANARY}],
+                "details": {
+                    "mode": mode, "agentScope": "user", "projectAgentsDir": None,
+                    "results": list(results if results is not None else []),
+                },
+            }
+            if top_usage is not None:
+                message["usage"] = top_usage
+            rows.append({
+                "type": "message", "id": "result", "parentId": "assistant",
+                "timestamp": "2026-09-04T10:00:09Z", "message": message,
+            })
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        return path
+
+    def _load(self, root):
+        with mock.patch.object(meter, "PI_AGENT_DIR", str(root)), \
+                mock.patch.object(meter, "_pi_native_adapters", {}), \
+                mock.patch.object(meter, "_RUNTIME_REGISTRY", None):
+            source = meter.pi_session_sources()[0]
+            return source, meter.recompute(source), meter.pi_summary(source)
+
+    def _records(self, summary):
+        return {record["kind"]: record for record in summary["_agent_records"]}
+
+    def test_single_child_run_adds_spend_and_emits_root_and_spawned_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(
+                root, results=[self._child_result(usage=self._child_usage())],
+            )
+            source, state, summary = self._load(root)
+
+        # Parent turn 100/20/10/5 plus child 1000/100/0/0.
+        self.assertEqual(state["tokens"], {
+            "input": 1100, "output": 120, "cache_read": 10, "cache_write": 5,
+        })
+        self.assertEqual(state["total_tokens"], 1235)
+        self.assertAlmostEqual(state["total_cost"], 0.2533)
+        # Child work is not presented as a parent model call.
+        self.assertEqual(len(state["executions"]), 1)
+        self.assertEqual(summary["turns"], 1)
+
+        records = self._records(summary)
+        self.assertEqual(set(records), {"root", "spawned"})
+        root_record, child = records["root"], records["spawned"]
+        self.assertEqual(root_record["session_id"], source["id"])
+        self.assertEqual(root_record["tokens"], 135)
+        self.assertAlmostEqual(root_record["cost"], 0.0033)
+        self.assertTrue(root_record["tokens_available"])
+        self.assertEqual(child["parent_id"], root_record["id"])
+        self.assertEqual(child["depth"], 1)
+        self.assertEqual(child["role"], "probe")
+        self.assertEqual(child["model"], "opencode-go/deepseek-v4.1-flash")
+        self.assertEqual(child["tokens"], 1100)
+        self.assertAlmostEqual(child["cost"], 0.25)
+        self.assertTrue(child["tokens_available"])
+        self.assertTrue(child["cost_available"])
+        self.assertEqual(child["executions"], 2)
+        self.assertEqual(child["activity_state"], "complete")
+        self.assertEqual(child["started_at"], state["executions"][0]["ts"])
+        self.assertEqual(child["session_id"], None)
+        self.assertTrue(child["id"].startswith("pi-agent-"))
+        self.assertNotIn(source["id"], child["id"])
+        # Root plus child equals the session headline exactly.
+        self.assertEqual(
+            root_record["tokens"] + child["tokens"], state["total_tokens"],
+        )
+        self.assertAlmostEqual(
+            root_record["cost"] + child["cost"], state["total_cost"], places=9,
+        )
+
+    def test_parallel_child_results_each_emit_a_record_and_sum_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(root, mode="parallel", results=[
+                self._child_result("scout", usage=self._child_usage(600, 60, cost=0.1)),
+                self._child_result("reviewer", usage=self._child_usage(400, 40, cost=0.2)),
+            ])
+            _source, state, summary = self._load(root)
+
+        children = [
+            record for record in summary["_agent_records"]
+            if record["kind"] == "spawned"
+        ]
+        self.assertEqual(sorted(record["role"] for record in children),
+                         ["reviewer", "scout"])
+        self.assertEqual(sum(record["tokens"] for record in children), 1100)
+        self.assertAlmostEqual(sum(record["cost"] for record in children), 0.3)
+        self.assertEqual(state["total_tokens"], 1235)
+        self.assertAlmostEqual(state["total_cost"], 0.3033)
+        self.assertEqual(len({record["id"] for record in children}), 2)
+
+    def test_top_level_result_usage_without_details_emits_one_aggregate_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(
+                root, results=[], top_usage=self._child_usage(500, 50, cost=0.3),
+            )
+            _source, state, summary = self._load(root)
+
+        children = [
+            record for record in summary["_agent_records"]
+            if record["kind"] == "spawned"
+        ]
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0]["role"], "probe")
+        self.assertEqual(children[0]["tokens"], 550)
+        self.assertAlmostEqual(children[0]["cost"], 0.3)
+        self.assertEqual(state["total_tokens"], 685)
+
+    def test_reconciling_details_and_top_level_usage_count_spend_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(
+                root, mode="parallel",
+                results=[
+                    self._child_result("scout", usage=self._child_usage(300, 30, cost=0.1)),
+                    self._child_result("worker", usage=self._child_usage(200, 20, cost=0.2)),
+                ],
+                top_usage=self._child_usage(500, 50, cost=0.3),
+            )
+            _source, state, summary = self._load(root)
+
+        children = [
+            record for record in summary["_agent_records"]
+            if record["kind"] == "spawned"
+        ]
+        self.assertEqual(sorted(record["role"] for record in children),
+                         ["scout", "worker"])
+        self.assertEqual(sum(record["tokens"] for record in children), 550)
+        self.assertEqual(state["total_tokens"], 685)
+        self.assertAlmostEqual(state["total_cost"], 0.3033)
+
+    def test_unreconciled_details_fall_back_to_one_aggregate_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(
+                root, mode="parallel",
+                arguments={"tasks": [
+                    {"agent": "scout", "task": self.CONTENT_CANARY},
+                    {"agent": "worker", "task": self.CONTENT_CANARY},
+                ]},
+                results=[
+                    self._child_result("scout", usage=self._child_usage(300, 30, cost=0.1)),
+                    self._child_result("worker", usage=self._child_usage(200, 20, cost=0.2)),
+                ],
+                top_usage=self._child_usage(900, 90, cost=0.9),
+            )
+            _source, state, summary = self._load(root)
+
+        children = [
+            record for record in summary["_agent_records"]
+            if record["kind"] == "spawned"
+        ]
+        self.assertEqual(len(children), 1)
+        self.assertIsNone(children[0]["role"])
+        self.assertEqual(children[0]["tokens"], 990)
+        self.assertEqual(state["total_tokens"], 1125)
+        self.assertAlmostEqual(state["total_cost"], 0.9033)
+
+    def test_run_without_usage_reports_unavailable_not_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(root, results=[self._child_result()])
+            _source, state, summary = self._load(root)
+
+        child = self._records(summary)["spawned"]
+        self.assertFalse(child["tokens_available"])
+        self.assertFalse(child["cost_available"])
+        self.assertIsNone(child["tokens"])
+        self.assertIsNone(child["cost"])
+        self.assertFalse(summary["availability"]["cost"])
+        self.assertFalse(summary["availability"]["tokens"])
+        self.assertFalse(state["availability"]["cost"])
+        self.assertFalse(state["availability"]["tokens"])
+        self.assertEqual(state["total_tokens"], 135)
+
+    def test_failed_child_run_marks_incomplete_and_keeps_role(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(root, results=[
+                self._child_result("reviewer", usage=self._child_usage(cost=0.05),
+                                   exit_code=1, stop_reason="error"),
+            ])
+            _source, _state, summary = self._load(root)
+
+        child = self._records(summary)["spawned"]
+        self.assertEqual(child["role"], "reviewer")
+        self.assertEqual(child["activity_state"], "incomplete")
+        self.assertEqual(child["failed_attempts"], 1)
+        self.assertIsNone(child["ended_at"])
+
+    def test_partial_failure_keeps_successful_sibling_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            path = self._write_subagent_session(root, mode="parallel", results=[
+                self._child_result("scout", usage=self._child_usage(cost=0.1)),
+                self._child_result("worker", usage=self._child_usage(cost=0.0),
+                                   exit_code=1, stop_reason="error"),
+            ])
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            rows[-1]["message"]["isError"] = True
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            _source, _state, summary = self._load(root)
+
+        children = {
+            record["role"]: record for record in summary["_agent_records"]
+            if record["kind"] == "spawned"
+        }
+        self.assertEqual(children["scout"]["activity_state"], "complete")
+        self.assertEqual(children["worker"]["activity_state"], "incomplete")
+        self.assertEqual(children["worker"]["failed_attempts"], 1)
+
+    def test_zero_cost_child_is_a_measured_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(
+                root, results=[self._child_result(usage=self._child_usage(cost=0.0))],
+            )
+            _source, _state, summary = self._load(root)
+
+        child = self._records(summary)["spawned"]
+        self.assertTrue(child["cost_available"])
+        self.assertEqual(child["cost"], 0.0)
+        self.assertTrue(summary["availability"]["cost"])
+
+    def test_unfinished_child_call_is_incomplete_without_invented_spend(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(root, include_result=False)
+            _source, state, summary = self._load(root)
+
+        child = self._records(summary)["spawned"]
+        self.assertEqual(child["activity_state"], "incomplete")
+        self.assertFalse(child["tokens_available"])
+        self.assertFalse(child["cost_available"])
+        self.assertEqual(state["total_tokens"], 135)
+        self.assertEqual(state["total_cost"], 0.0033)
+
+    def test_empty_results_run_emits_no_agent_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(root, results=[])
+            _source, _state, summary = self._load(root)
+
+        self.assertNotIn("_agent_records", summary)
+
+    def test_child_role_rejects_paths_urls_credentials_and_prose(self):
+        bad_roles = [
+            "/Users/henry/agents/secret.md",
+            "https://example.test/agent",
+            "bearer abcdef",
+            "api_key=abcdef",
+            "a" * 80,
+            "two words here",
+            "scout\x00hidden",
+        ]
+        for bad in bad_roles:
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "agent"
+                self._write_subagent_session(
+                    root, results=[self._child_result(bad, usage=self._child_usage())],
+                )
+                _source, state, summary = self._load(root)
+                child = self._records(summary)["spawned"]
+                self.assertIsNone(child["role"])
+                encoded = json.dumps({"summary": summary, "state": state})
+                self.assertNotIn(bad, encoded)
+
+    def test_child_content_never_reaches_summary_state_or_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(
+                root, results=[self._child_result(usage=self._child_usage())],
+            )
+            _source, state, summary = self._load(root)
+
+        encoded = json.dumps({"summary": summary, "state": state})
+        self.assertNotIn(self.CONTENT_CANARY, encoded)
+        self.assertNotIn("stderr", encoded)
+        self.assertNotIn("agentSource", encoded)
+        self.assertNotIn("messages", encoded)
+
+    def test_non_subagent_tool_usage_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(
+                root, tool_name="summarize",
+                results=[self._child_result(usage=self._child_usage())],
+            )
+            _source, state, summary = self._load(root)
+
+        self.assertEqual(state["total_tokens"], 135)
+        self.assertNotIn("_agent_records", summary)
+
+    def test_canonical_agent_sources_selects_pi_rows_once(self):
+        source = {
+            "id": "pi-session", "path": "/tmp/pi.jsonl", "provider": "pi",
+            "runtime": "Pi", "label": "Pi", "project": "/repo", "mtime": 1,
+        }
+        selected = meter.canonical_agent_sources([source, dict(source)])
+        self.assertEqual(len(selected), 2)
+        self.assertTrue(all(row["provider"] == "pi" for row in selected))
+
+    def test_agent_group_and_inventory_include_pi_children(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(
+                root, results=[self._child_result(usage=self._child_usage())],
+            )
+            _source, _state, summary = self._load(root)
+
+        groups = meter._domain_build_agent_groups([summary])
+        usage = meter._agent_usage_projection(
+            meter._domain_aggregate_agent_usage(groups)
+        )
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(usage["totals"]["agents"], 1)
+        self.assertAlmostEqual(usage["totals"]["cost"], 0.25)
+        self.assertEqual(usage["inventory"][0]["role"], "probe")
+        self.assertEqual(usage["inventory"][0]["runtime"], "pi")
+        self.assertEqual(
+            usage["models"][0]["id"],
+            "opencode-go/deepseek-v4.1-flash::pi::spawned",
+        )
+
+
 class OpenCodeTests(unittest.TestCase):
     """OpenCode is discovered from its read-only SQLite database."""
 
