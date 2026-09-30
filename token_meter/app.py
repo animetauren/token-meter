@@ -83,6 +83,7 @@ from token_meter.domain.aggregates import (
 )
 from token_meter.domain.agents import (
     aggregate_agent_usage as _domain_aggregate_agent_usage,
+    build_agent_graph as _domain_build_agent_graph,
     build_agent_groups as _domain_build_agent_groups,
     find_agent_group as _domain_find_agent_group,
 )
@@ -7417,9 +7418,16 @@ def canonical_agent_sources(sources):
 
     groups = defaultdict(list)
     for index, source in enumerate(source_rows):
-        if source.get("provider") != "codex":
+        provider = source.get("provider")
+        if provider not in ("codex", "opencode"):
             continue
-        physical_id = str(source.get("physical_trace_id") or "")
+        if provider == "opencode":
+            # One OpenCode session id is one physical agent. Select it once so a
+            # child is never summarized twice, and never collapse a child into
+            # its parent or another child.
+            physical_id = str(source.get("id") or "")
+        else:
+            physical_id = str(source.get("physical_trace_id") or "")
         key = physical_id or "path:" + str(source.get("path") or index)
         groups[key].append((index, source))
 
@@ -7440,12 +7448,12 @@ def canonical_agent_sources(sources):
             str(source.get("path") or ""),
         )
 
-    codex_selected = {
+    selected_agents = {
         min(candidates, key=rank)[0] for candidates in groups.values()
     }
     selected.extend(
         source for index, source in enumerate(source_rows)
-        if index in codex_selected
+        if index in selected_agents
     )
     return selected
 
@@ -7498,9 +7506,13 @@ def cross_session(sources=None):
         if row.get("_agent_records"):
             agent_rows.append(row)
 
-    agent_groups = _domain_build_agent_groups(agent_rows, now=now)
+    agent_groups, unresolved_agents = _domain_build_agent_graph(
+        agent_rows, now=now,
+    )
     agent_usage = _agent_usage_projection(
-        _domain_aggregate_agent_usage(agent_groups, now=now)
+        _domain_aggregate_agent_usage(
+            agent_groups, unresolved=unresolved_agents, now=now,
+        )
     )
 
     aggregate = _domain_aggregate_cross_session_rows(
