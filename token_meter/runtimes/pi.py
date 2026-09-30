@@ -157,7 +157,7 @@ def _subagent_model_id(value):
         or "://" in text
         or text.startswith(("/", "\\", "~", "./", "../"))
         or re.match(r"^[A-Za-z]:[\\/]", text)
-        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/@:+-]*", text)
+        or not re.fullmatch(r"[A-Za-z0-9@][A-Za-z0-9._/@:+-]*", text)
         or lowered.startswith(("bearer ", "sk-", "-----begin "))
         or any(marker in lowered for marker in (
             "api_key=", "api-key=", "secret=", "token=",
@@ -994,7 +994,8 @@ class PiRuntimeAdapter:
             for key in cost:
                 cost[key] += breakdown[key]
             run_model = (
-                _public_model_id(run["model"]) if run["model"] else primary_model
+                _public_model_id(run["model"]) if run["model"]
+                else "unknown-model"
             )
             model_tok[run_model] += usage["tokens"]
             model_cost[run_model] += (
@@ -1120,6 +1121,7 @@ class PiRuntimeAdapter:
             max(own_model_tok, key=own_model_tok.get) if own_model_tok
             else source.get("model")
         )
+        own_terminal = bool(turns and turns[-1]["stop_reason"] == "stop")
         nested = _nested_usage_totals(runs)
         for run in runs:
             usage = run.get("usage")
@@ -1131,7 +1133,7 @@ class PiRuntimeAdapter:
             total_cost += value
             run_model = (
                 _public_model_id(run["model"]) if run["model"]
-                else (primary_own_model or "unknown-model")
+                else "unknown-model"
             )
             model_tok[run_model] += usage["tokens"]
             model_cost[run_model] += value
@@ -1168,9 +1170,7 @@ class PiRuntimeAdapter:
             "tokens_available": own_tokens_available,
             "model": primary_own_model,
             "executions": len(turns),
-            "terminal": bool(
-                turns and turns[-1]["stop_reason"] == "stop"
-            ),
+            "terminal": own_terminal,
             "started_at": own_start or None,
             "last_activity_at": own_end or None,
             "work_time_s": own_active,
@@ -1209,7 +1209,7 @@ class PiRuntimeAdapter:
             "window": None, "latest_pct": None, "estimated": False,
         }
         row["_context_samples"] = context_samples[-compat["context_sample_limit"]:]
-        row["terminal"] = False
+        row["terminal"] = own_terminal
         row["_tool_evidence"] = compat["summarize_tool_evidence"](tool_calls)
         if agent_records:
             row["_agent_records"] = list(agent_records)
@@ -1292,7 +1292,7 @@ class PiRuntimeAdapter:
                 "role": run.get("role") or None,
                 "model": (
                     _public_model_id(run["model"]) if run.get("model")
-                    else own_model
+                    else "unknown-model"
                 ),
                 "activity_state": run.get("activity_state") or "incomplete",
                 "started_at": started,

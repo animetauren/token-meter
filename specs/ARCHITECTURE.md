@@ -138,7 +138,11 @@ stderr, and outputs are never read. A top-level result `usage` is authoritative
 when Pi reports one and a per-child split is attributed only when it reconciles
 exactly; otherwise one aggregate run carries the total. A run without usage
 evidence reports unavailable tokens and cost and makes the session coverage
-partial rather than folding an unknown into a complete total.
+partial rather than folding an unknown into a complete total. A child whose
+model is unreported or fails sanitization is attributed to an explicit
+`unknown-model` key, never to the parent's model. A Pi session is terminal when
+its final assistant turn stopped normally, matching how other runtimes derive
+liveness from recorded stop evidence.
 
 ## Domain and Model Flow
 

@@ -92,6 +92,12 @@ and are never read by the adapter.
    zero and `stopReason` is not `error` or `aborted`; otherwise `incomplete`.
    A call with no result is `working` while recent and `incomplete` once stale.
    A finished call with an empty `results` list ran no child and emits nothing.
+10. **Session liveness.** Pi persists a `stopReason` on assistant entries. The
+    adapter marks a session terminal when its final assistant turn stopped
+    normally, and the root agent record reuses that evidence, so a finished Pi
+    session is presented as waiting/complete instead of working. This replaces
+    the previous unconditional nonterminal Pi summary flag; it is a correction
+    required by the same evidence this change adds, not a new signal.
 
 ## Non-Goals
 

@@ -15553,7 +15553,7 @@ class PiSubagentTests(unittest.TestCase):
                                 top_usage=None, include_result=True,
                                 arguments=None, tool_name="subagent",
                                 mode="single", recent_seconds=None,
-                                stop_reason="stop"):
+                                stop_reason="stop", final_turn_usage=None):
         directory = Path(agent_root) / "sessions" / "--repo--"
         directory.mkdir(parents=True)
         path = directory / "pi-subagent-session.jsonl"
@@ -15561,7 +15561,7 @@ class PiSubagentTests(unittest.TestCase):
             stamps = [
                 "2026-09-04T10:00:00Z", "2026-09-04T10:00:01Z",
                 "2026-09-04T10:00:02Z", "2026-09-04T10:00:05Z",
-                "2026-09-04T10:00:09Z",
+                "2026-09-04T10:00:09Z", "2026-09-04T10:00:12Z",
             ]
         else:
             base = (
@@ -15571,7 +15571,7 @@ class PiSubagentTests(unittest.TestCase):
             stamps = [
                 (base + datetime.timedelta(seconds=offset)).isoformat()
                 .replace("+00:00", "Z")
-                for offset in (0, 1, 2, 5, 9)
+                for offset in (0, 1, 2, 5, 9, 12)
             ]
         tool_call = {
             "type": "toolCall", "id": "call-subagent", "name": tool_name,
@@ -15614,6 +15614,16 @@ class PiSubagentTests(unittest.TestCase):
             rows.append({
                 "type": "message", "id": "result", "parentId": "assistant",
                 "timestamp": stamps[4], "message": message,
+            })
+        if final_turn_usage is not None:
+            rows.append({
+                "type": "message", "id": "assistant-final",
+                "parentId": "result", "timestamp": stamps[5],
+                "message": {
+                    "role": "assistant", "model": "claude-test",
+                    "provider": "anthropic", "content": [],
+                    "stopReason": "stop", "usage": final_turn_usage,
+                },
             })
         path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
         return path
@@ -15916,21 +15926,46 @@ class PiSubagentTests(unittest.TestCase):
             )
             _source, _state, summary = self._load(root)
 
+        self.assertTrue(summary["terminal"])
         root_record = self._records(summary)["root"]
         self.assertEqual(root_record["activity_state"], "complete")
         self.assertEqual(
             root_record["ended_at"], root_record["last_activity_at"],
         )
 
+    def test_realistic_tool_use_then_stop_marks_session_terminal(self):
+        final_usage = {
+            "input": 50, "output": 10, "cacheRead": 0, "cacheWrite": 0,
+            "totalTokens": 60,
+            "cost": {"input": 0.0005, "output": 0.0005,
+                     "cacheRead": 0.0, "cacheWrite": 0.0},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(
+                root, stop_reason="toolUse",
+                results=[self._child_result(usage=self._child_usage())],
+                final_turn_usage=final_usage,
+            )
+            _source, state, summary = self._load(root)
+
+        self.assertTrue(summary["terminal"])
+        self.assertEqual(summary["turns"], 2)
+        self.assertEqual(
+            self._records(summary)["root"]["activity_state"], "complete",
+        )
+        self.assertAlmostEqual(state["total_cost"], 0.2543)
+
     def test_nonterminal_session_root_stays_incomplete(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "agent"
             self._write_subagent_session(
-                root, stop_reason=None,
+                root, stop_reason="toolUse",
                 results=[self._child_result(usage=self._child_usage())],
             )
             _source, _state, summary = self._load(root)
 
+        self.assertFalse(summary["terminal"])
         root_record = self._records(summary)["root"]
         self.assertEqual(root_record["activity_state"], "incomplete")
         self.assertIsNone(root_record["ended_at"])
@@ -15979,9 +16014,40 @@ class PiSubagentTests(unittest.TestCase):
                 _source, state, summary = self._load(root)
 
                 child = self._records(summary)["spawned"]
-                self.assertEqual(child["model"], "claude-test")
+                self.assertEqual(child["model"], "unknown-model")
                 encoded = json.dumps({"summary": summary, "state": state})
                 self.assertNotIn(bad, encoded)
+
+    def test_child_model_accepts_provider_prefixed_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(root, results=[
+                self._child_result(
+                    usage=self._child_usage(),
+                    model="@cf/meta/llama-3.1-8b-instruct",
+                ),
+            ])
+            _source, _state, summary = self._load(root)
+
+        child = self._records(summary)["spawned"]
+        self.assertEqual(child["model"], "@cf/meta/llama-3.1-8b-instruct")
+
+    def test_unreported_child_model_is_unknown_not_the_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(root, results=[
+                self._child_result(usage=self._child_usage(), model=""),
+            ])
+            _source, state, summary = self._load(root)
+
+        child = self._records(summary)["spawned"]
+        self.assertEqual(child["model"], "unknown-model")
+        self.assertEqual(summary["primary_model"], "claude-test")
+        self.assertEqual(summary["_model_cost"]["unknown-model"], 0.25)
+        self.assertAlmostEqual(summary["_model_cost"]["claude-test"], 0.0033)
+        mix = {row["model"]: row["cost"] for row in state["analyses"]["model_mix"]}
+        self.assertEqual(mix["unknown-model"], 0.25)
+        self.assertAlmostEqual(mix["claude-test"], 0.0033)
 
     def test_child_content_never_reaches_summary_state_or_records(self):
         with tempfile.TemporaryDirectory() as tmp:
