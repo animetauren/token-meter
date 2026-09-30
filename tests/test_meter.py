@@ -16018,7 +16018,10 @@ class PiSubagentTests(unittest.TestCase):
     def test_child_model_rejects_credential_and_path_shapes(self):
         for bad in ("sk-secret-value", "bearer abc", "/Users/henry/model",
                     "https://example.test/model", "model with space",
-                    "probe?x=1"):
+                    "probe?x=1", "models/llama-3.gguf",
+                    "Users/henry/.ssh/id_rsa", "a/../../etc/passwd",
+                    "example.com/secret", "localhost:8080/model",
+                    "home/henry/model", "C:/Users/henry/model"):
             with self.subTest(model=bad), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp) / "agent"
                 self._write_subagent_session(root, results=[
@@ -16034,18 +16037,25 @@ class PiSubagentTests(unittest.TestCase):
                 self.assertNotIn(bad, encoded)
 
     def test_child_model_accepts_provider_prefixed_ids(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "agent"
-            self._write_subagent_session(root, results=[
-                self._child_result(
-                    usage=self._child_usage(),
-                    model="@cf/meta/llama-3.1-8b-instruct",
-                ),
-            ])
-            _source, _state, summary = self._load(root)
+        good_models = (
+            "@cf/meta/llama-3.1-8b-instruct",
+            "opencode-go/deepseek-v4.1-flash",
+            "anthropic/claude-opus-4-8",
+            "meta-llama/Llama-3.1-70B-Instruct",
+            "accounts/fireworks/models/llama-v3p1-70b-instruct",
+            "qwen2.5-coder:32b",
+            "amazon.nova-pro-v1:0",
+        )
+        for good in good_models:
+            with self.subTest(model=good), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "agent"
+                self._write_subagent_session(root, results=[
+                    self._child_result(usage=self._child_usage(), model=good),
+                ])
+                _source, _state, summary = self._load(root)
 
-        child = self._records(summary)["spawned"]
-        self.assertEqual(child["model"], "@cf/meta/llama-3.1-8b-instruct")
+                child = self._records(summary)["spawned"]
+                self.assertEqual(child["model"], good.lower())
 
     def test_unreported_child_model_is_unknown_not_the_parent(self):
         with tempfile.TemporaryDirectory() as tmp:

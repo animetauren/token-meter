@@ -89,7 +89,11 @@ and are never read by the adapter.
 8. **Roles.** The provider-reported `agent` name is the role. It is bounded to
    64 characters and must match `[A-Za-z][A-Za-z0-9_-]*`; paths, URLs,
    credentials, control characters, and arbitrary prose are rejected. Roles
-   remain browser identity only, as for Claude, Codex, and OpenCode.
+   remain browser identity only, as for Claude, Codex, and OpenCode. A reported
+   model value must not be path-shaped: hidden or traversal segments, home and
+   directory roots, host-shaped namespaces, and model-file extensions are
+   rejected, while provider namespaces such as `@cf/meta/...`,
+   `opencode-go/...`, and `accounts/fireworks/models/...` remain valid.
 9. **Lifecycle.** A completed result is `complete` when `exitCode` is absent or
    zero and `stopReason` is not `error` or `aborted`; otherwise `incomplete`.
    A call with no result is `working` while recent and `incomplete` once stale.

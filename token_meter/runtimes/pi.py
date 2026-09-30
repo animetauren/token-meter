@@ -40,6 +40,15 @@ MAX_TURNS = 2_000
 MAX_TOOLS = 2_000
 MAX_SUBAGENT_RUNS = 500
 SUBAGENT_TOOL_NAME = "subagent"
+_MODEL_FILE_EXTENSIONS = (
+    ".gguf", ".safetensors", ".ckpt", ".onnx", ".pt", ".pth", ".bin",
+    ".rsa", ".pem", ".key", ".crt", ".cer", ".pub",
+)
+_MODEL_PATH_ROOT_SEGMENTS = frozenset((
+    "users", "home", "etc", "var", "tmp", "opt", "usr", "private",
+    "library", "applications", "documents", "desktop", "downloads",
+    "localhost",
+))
 
 
 def _file_signature(path):
@@ -145,13 +154,32 @@ def _public_agent_id(*parts):
     return "pi-agent-" + digest
 
 
+def _model_id_is_path_like(text):
+    """Reject strings shaped like a filesystem or host path, not a model."""
+    segments = text.split("/")
+    if len(segments) > 1:
+        first = segments[0].lower()
+        if re.fullmatch(r"[a-z0-9-]+(?::\d+)?(?:\.[a-z0-9-]+)+", first):
+            # Host-shaped namespace such as example.com/secret.
+            return True
+        if first.split(":", 1)[0] in _MODEL_PATH_ROOT_SEGMENTS:
+            return True
+    for segment in segments:
+        if not segment or segment.startswith("."):
+            return True
+        if segment.lower().endswith(_MODEL_FILE_EXTENSIONS):
+            return True
+    return False
+
+
 def _subagent_model_id(value):
     if not isinstance(value, str):
         return ""
     text = value.strip()
     lowered = text.lower()
     if (
-        not text or len(text) > 120
+        _model_id_is_path_like(text)
+        or not text or len(text) > 120
         or any(char.isspace() for char in text)
         or any(ord(char) < 32 or ord(char) == 127 for char in text)
         or "://" in text
