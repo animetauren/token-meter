@@ -154,11 +154,14 @@ contracts.
 Matched-pace comparison is per model-runtime pair. Each pair compares its two
 completed-turn histories in full, so its cost grows with the product of the two
 sample counts and a single long history can dominate cross-session aggregation.
-Comparisons are therefore cached per pair, keyed by a digest of each side's
-samples, so a new turn for one model rebuilds only the pairs that model takes
-part in. The pair cache is also written to the Token Meter state directory and
-reloaded on start, so a restart reuses unchanged pairs instead of rebuilding
-every pair. Only model and runtime identifiers and aggregate duration, token,
+Comparisons are therefore cached per pair, keyed by the local day plus a digest
+of each side's samples, so a new turn for one model rebuilds only the pairs that
+model takes part in and a day rollover never reuses previous-day windows. The
+global pair cache is bounded, written to the Token Meter state directory only
+when an entry changed, and reloaded on start with per-entry shape and
+finite-number validation, so a restart reuses unchanged pairs instead of
+rebuilding every pair. Project-scoped model stats compute from a private,
+unpersisted pair cache and never evict or overwrite global entries. Only model and runtime identifiers and aggregate duration, token,
 ratio, and coverage values are stored; the file carries no prompt, response,
 tool, path, or raw trace content. Persistence is enabled only by the server
 entrypoint, so importing the module never writes the user's cache. A rebuild

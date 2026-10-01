@@ -394,9 +394,11 @@ _summary_cache = {}
 _summary_cache_lock = threading.Lock()
 _matched_pace_cache = {"signature": None, "data": None}
 _matched_pace_cache_lock = threading.Lock()
-# One entry per model-runtime pair, so a changed model only rebuilds the pairs
-# it participates in. Reused across restarts via TOKEN_METER_MATCHED_PACE_CACHE.
-# Guarded by _matched_pace_cache_lock.
+# One entry per model-runtime pair for the global (all-session) scope, so a
+# changed model only rebuilds the pairs it participates in. Reused across
+# restarts via TOKEN_METER_MATCHED_PACE_CACHE. Loaded, read, mutated, and saved
+# only by the thread holding the single-flight build flag below; it is never
+# touched by project-scoped builds.
 _matched_pace_pair_cache = {}
 _matched_pace_pair_cache_loaded = False
 # Single-flight guard: one rebuild at a time, so concurrent requests share one
@@ -406,7 +408,9 @@ _matched_pace_build_state = {"building": False}
 # Persistence is opt-in so importing the module (tests, tools) never writes the
 # user's cache file. The server entrypoint turns it on.
 _matched_pace_persist = False
-MATCHED_PACE_CACHE_SCHEMA = 1
+# Bump whenever the matching algorithm, thresholds, result fields, or pair-key
+# format change, so stale persisted comparisons are discarded on load.
+MATCHED_PACE_CACHE_SCHEMA = 2
 MATCHED_PACE_CACHE_MAX_PAIRS = 4000
 _SKILL_CATALOG_TTL_S = 60.0
 _skill_catalog_cache = {"rows": None, "at": 0.0}
@@ -7029,15 +7033,65 @@ def _pace_samples_signature(samples, fields):
     return digest.hexdigest()
 
 
+MATCHED_PACE_WINDOW_KEYS = ("today", "yesterday", "7", "30", "90", "all")
+_MATCHED_PACE_INT_FIELDS = ("a_samples", "b_samples", "matched_pairs")
+_MATCHED_PACE_FLOAT_FIELDS = ("coverage", "pace_ratio", "ci_low", "ci_high")
+
+
+def _valid_matched_pace_comparison(value, a_id, b_id):
+    """Return True when a stored comparison has the exact builder shape."""
+    if not isinstance(value, dict):
+        return False
+    if value.get("a_id") != a_id or value.get("b_id") != b_id:
+        return False
+    for field in _MATCHED_PACE_INT_FIELDS:
+        number = value.get(field)
+        if isinstance(number, bool) or not isinstance(number, int) or number < 0:
+            return False
+    for field in _MATCHED_PACE_FLOAT_FIELDS:
+        number = value.get(field)
+        if (isinstance(number, bool) or not isinstance(number, (int, float))
+                or not math.isfinite(number)):
+            return False
+    if not isinstance(value.get("available"), bool):
+        return False
+    if "reason" in value and not isinstance(value["reason"], str):
+        return False
+    return True
+
+
+def _valid_matched_pace_entry(entry):
+    """Return the (key, cached) pair for a usable stored entry, else None."""
+    if not isinstance(entry, dict):
+        return None
+    a_id, b_id = entry.get("a_id"), entry.get("b_id")
+    signature, windows = entry.get("signature"), entry.get("windows")
+    if not (isinstance(a_id, str) and isinstance(b_id, str)
+            and isinstance(signature, str) and isinstance(windows, dict)):
+        return None
+    if set(windows) != set(MATCHED_PACE_WINDOW_KEYS):
+        return None
+    if not all(_valid_matched_pace_comparison(windows[window], a_id, b_id)
+               for window in MATCHED_PACE_WINDOW_KEYS):
+        return None
+    return (a_id, b_id), {"signature": signature, "windows": windows}
+
+
 def _ensure_matched_pace_cache_loaded():
-    """Load the persisted pair cache once. Caller holds _matched_pace_cache_lock."""
+    """Load the persisted pair cache once. Caller holds the single-flight flag."""
     global _matched_pace_pair_cache_loaded
     if _matched_pace_pair_cache_loaded:
         return
     _matched_pace_pair_cache_loaded = True
     if not _matched_pace_persist:
         return
-    stored = load_json(TOKEN_METER_MATCHED_PACE_CACHE, {})
+    try:
+        with open(TOKEN_METER_MATCHED_PACE_CACHE, encoding="utf-8") as fh:
+            stored = json.load(fh)
+    except (OSError, ValueError, RecursionError):
+        # Missing, unreadable, undecodable (including invalid UTF-8), or
+        # malformed files are a cold cache, never a request failure.
+        return
     if not isinstance(stored, dict):
         return
     if stored.get("schema") != MATCHED_PACE_CACHE_SCHEMA:
@@ -7046,17 +7100,11 @@ def _ensure_matched_pace_cache_loaded():
     if not isinstance(pairs, list):
         return
     for entry in pairs:
-        if not isinstance(entry, dict):
-            continue
-        a_id, b_id = entry.get("a_id"), entry.get("b_id")
-        signature, windows = entry.get("signature"), entry.get("windows")
-        if not (isinstance(a_id, str) and isinstance(b_id, str)
-                and isinstance(signature, str) and isinstance(windows, dict)):
-            continue
-        _matched_pace_pair_cache[(a_id, b_id)] = {
-            "signature": signature,
-            "windows": windows,
-        }
+        if len(_matched_pace_pair_cache) >= MATCHED_PACE_CACHE_MAX_PAIRS:
+            break
+        valid = _valid_matched_pace_entry(entry)
+        if valid is not None:
+            _matched_pace_pair_cache[valid[0]] = valid[1]
 
 
 def _save_matched_pace_pair_cache():
@@ -7064,22 +7112,19 @@ def _save_matched_pace_pair_cache():
 
     The stored fields are model and runtime identifiers plus aggregate duration,
     token, ratio, and coverage numbers. No prompt, response, tool, path, or raw
-    trace content is written.
+    trace content is written. Caller holds the single-flight flag.
     """
     if not _matched_pace_persist:
         return
-    with _matched_pace_cache_lock:
-        entries = [
-            {
-                "a_id": pair_key[0],
-                "b_id": pair_key[1],
-                "signature": cached.get("signature"),
-                "windows": cached.get("windows"),
-            }
-            for pair_key, cached in _matched_pace_pair_cache.items()
-        ][-MATCHED_PACE_CACHE_MAX_PAIRS:]
-    if not entries:
-        return
+    entries = [
+        {
+            "a_id": pair_key[0],
+            "b_id": pair_key[1],
+            "signature": cached.get("signature"),
+            "windows": cached.get("windows"),
+        }
+        for pair_key, cached in _matched_pace_pair_cache.items()
+    ][:MATCHED_PACE_CACHE_MAX_PAIRS]
     try:
         atomic_write_text(
             TOKEN_METER_MATCHED_PACE_CACHE,
@@ -7089,8 +7134,14 @@ def _save_matched_pace_pair_cache():
         pass
 
 
-def _build_matched_pace_windows(sample_groups, today, signature_fields):
-    """Compute every model-runtime pair comparison. Caller owns no lock."""
+def _build_matched_pace_windows(sample_groups, today, signature_fields, pair_cache):
+    """Compute every model-runtime pair comparison, reusing ``pair_cache``.
+
+    Returns ``(data, changed)`` where ``changed`` reports whether any pair cache
+    entry was added, replaced, or removed. Caller owns no lock; for the global
+    pair cache the caller holds the single-flight flag.
+    """
+    changed = False
     rules = {
         "today": ("exact", today.isoformat()),
         "yesterday": ("exact", (today - datetime.timedelta(days=1)).isoformat()),
@@ -7123,8 +7174,12 @@ def _build_matched_pace_windows(sample_groups, today, signature_fields):
         for b_id in ids[a_index + 1:]:
             pair_key = (a_id, b_id)
             live_pairs.add(pair_key)
-            pair_signature = f"{id_signatures[a_id]}|{id_signatures[b_id]}"
-            cached = _matched_pace_pair_cache.get(pair_key)
+            # Windows are cut relative to today, so the day is part of the key:
+            # a cached pair from a previous day must never be reused.
+            pair_signature = (
+                f"{today.isoformat()}|{id_signatures[a_id]}|{id_signatures[b_id]}"
+            )
+            cached = pair_cache.get(pair_key)
             if cached is not None and cached["signature"] == pair_signature:
                 per_window = cached["windows"]
             else:
@@ -7141,24 +7196,36 @@ def _build_matched_pace_windows(sample_groups, today, signature_fields):
                     )
                     for window in rules
                 }
-                _matched_pace_pair_cache[pair_key] = {
+                pair_cache[pair_key] = {
                     "signature": pair_signature,
                     "windows": per_window,
                 }
+                changed = True
             for window in rules:
                 result[window].append(per_window[window])
-    for stale_key in set(_matched_pace_pair_cache) - live_pairs:
-        del _matched_pace_pair_cache[stale_key]
-    return {
+    for stale_key in set(pair_cache) - live_pairs:
+        del pair_cache[stale_key]
+        changed = True
+    # Bound memory and the persisted file. Pairs beyond the cap are still
+    # reported; they are simply recomputed on the next build.
+    while len(pair_cache) > MATCHED_PACE_CACHE_MAX_PAIRS:
+        del pair_cache[next(reversed(pair_cache))]
+        changed = True
+    data = {
         "method": "nearest workload match on context, input, output, cache, model calls, tools, and recency",
         "min_pairs": MATCHED_PACE_MIN_PAIRS,
         "min_coverage": MATCHED_PACE_MIN_COVERAGE,
         "windows": result,
     }
+    return data, changed
 
 
-def matched_pace_windows(sample_groups, now_ts=None):
-    """Build pairwise matched-pace comparisons for every dashboard history window."""
+def matched_pace_windows(sample_groups, now_ts=None, persistent=True):
+    """Build pairwise matched-pace comparisons for every dashboard history window.
+
+    ``persistent=False`` is the project scope: it computes from a private pair
+    cache and never reads, evicts, overwrites, or persists global entries.
+    """
     today = datetime.date.fromtimestamp(float(now_ts if now_ts is not None else time.time()))
     digest = hashlib.sha256(today.isoformat().encode("utf-8"))
     signature_fields = (
@@ -7174,9 +7241,14 @@ def matched_pace_windows(sample_groups, now_ts=None):
             digest.update(repr(values).encode("utf-8", errors="replace"))
     signature = digest.hexdigest()
 
+    if not persistent:
+        data, _ = _build_matched_pace_windows(
+            sample_groups, today, signature_fields, {},
+        )
+        return data
+
     while True:
         with _matched_pace_cache_lock:
-            _ensure_matched_pace_cache_loaded()
             if (
                 _matched_pace_cache.get("signature") == signature
                 and _matched_pace_cache.get("data") is not None
@@ -7193,10 +7265,12 @@ def matched_pace_windows(sample_groups, now_ts=None):
             _matched_pace_build_state["building"] = True
         data = None
         try:
-            data = _build_matched_pace_windows(
-                sample_groups, today, signature_fields,
+            _ensure_matched_pace_cache_loaded()
+            data, changed = _build_matched_pace_windows(
+                sample_groups, today, signature_fields, _matched_pace_pair_cache,
             )
-            _save_matched_pace_pair_cache()
+            if changed:
+                _save_matched_pace_pair_cache()
         finally:
             if data is not None:
                 with _matched_pace_cache_lock:
@@ -7452,12 +7526,18 @@ def git_delivery_watcher():
         next_scan_at = time.monotonic() + GIT_DELIVERY_INTERVAL_S
 
 
-def aggregate_model_stats(session_rows):
+def aggregate_model_stats(session_rows, global_scope=True):
+    # Project-scoped stats see a subset of samples; they must not evict or
+    # overwrite the persisted global pair cache.
+    matched_pace = (
+        matched_pace_windows if global_scope
+        else functools.partial(matched_pace_windows, persistent=False)
+    )
     return _domain_aggregate_model_stats(
         session_rows,
         runtime_resolver=source_runtime_label,
         throughput_finalizer=_finalize_throughput_fields,
-        matched_pace=matched_pace_windows,
+        matched_pace=matched_pace,
         project_option_limit=MODEL_PROJECT_OPTION_LIMIT,
         project_resolver=project_filter_key,
     )
@@ -7831,7 +7911,7 @@ def project_model_stats(project):
     ]
     if not matching:
         return {"ok": False, "error": "Project was not found."}, 404
-    stats = aggregate_model_stats(matching)
+    stats = aggregate_model_stats(matching, global_scope=False)
     stats.pop("projects", None)
     stats.pop("projects_truncated", None)
     cache[project] = stats

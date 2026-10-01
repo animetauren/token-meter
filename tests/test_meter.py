@@ -2471,6 +2471,8 @@ class ModelPerformanceTests(unittest.TestCase):
         meter._matched_pace_pair_cache_loaded = False
         meter._matched_pace_build_state["building"] = False
         meter._matched_pace_persist = True
+        meter._matched_pace_cache.update(signature=None, data=None)
+        self.addCleanup(meter._matched_pace_cache.update, signature=None, data=None)
 
     def test_parse_iso_reuses_bounded_timestamp_conversions(self):
         meter.parse_iso.cache_clear()
@@ -3372,7 +3374,10 @@ class ModelPerformanceTests(unittest.TestCase):
         for payload in (
             "{ not json",
             json.dumps({"schema": 999, "pairs": "unexpected"}),
-            json.dumps({"schema": 1, "pairs": [{"a_id": 5}, "junk"]}),
+            json.dumps({
+                "schema": meter.MATCHED_PACE_CACHE_SCHEMA,
+                "pairs": [{"a_id": 5}, "junk"],
+            }),
         ):
             with self.subTest(payload=payload[:24]):
                 self._pace_cache_path.write_text(payload)
@@ -3427,6 +3432,196 @@ class ModelPerformanceTests(unittest.TestCase):
             acquired,
             "matched_pace_windows must not hold the cache lock while rebuilding",
         )
+
+    @staticmethod
+    def _pace_groups(now, names=("alpha", "beta", "gamma"), day_offsets=(0,)):
+        """Build 20 timed turns per model on each day offset from ``now``."""
+        def samples(duration, offset):
+            rows = []
+            for day_offset in day_offsets:
+                ts = now - day_offset * 86400
+                day = datetime.date.fromtimestamp(ts).isoformat()
+                rows.extend({
+                    "duration_s": duration + day_offset, "ts": ts + offset + index,
+                    "day": day, "input_tokens": 10000,
+                    "peak_input_tokens": 10000, "cache_read_tokens": 0,
+                    "output_tokens": 1000, "tool_calls": 0, "model_calls": 1,
+                } for index in range(20))
+            return rows
+
+        return {name: samples(10 + index, index * 100)
+                for index, name in enumerate(names)}
+
+    @staticmethod
+    def _drop_pace_memory(loaded=False):
+        """Drop in-memory matched-pace state; ``loaded=False`` simulates restart."""
+        meter._matched_pace_pair_cache.clear()
+        meter._matched_pace_pair_cache_loaded = loaded
+        meter._matched_pace_cache["signature"] = None
+        meter._matched_pace_cache["data"] = None
+
+    def _cold_pace(self, groups, now):
+        self._drop_pace_memory(loaded=True)
+        return meter.matched_pace_windows(groups, now_ts=now)
+
+    def test_matched_pace_pair_cache_does_not_reuse_previous_day_windows(self):
+        now = datetime.datetime(2026, 8, 11, 12, 0, 0).timestamp()
+        tomorrow = now + 86400
+        groups = self._pace_groups(now, day_offsets=(0, 1))
+        meter.matched_pace_windows(groups, now_ts=now)
+        rolled = meter.matched_pace_windows(groups, now_ts=tomorrow)
+        cold = self._cold_pace(groups, tomorrow)
+
+        self.assertEqual(rolled, cold)
+        # The previous "today" samples are now "yesterday"; nothing is today.
+        self.assertFalse(any(row["available"] for row in rolled["windows"]["today"]))
+        self.assertTrue(all(row["available"] for row in rolled["windows"]["yesterday"]))
+
+    def test_matched_pace_persisted_pairs_do_not_survive_a_day_rollover(self):
+        now = datetime.datetime(2026, 8, 11, 12, 0, 0).timestamp()
+        tomorrow = now + 86400
+        groups = self._pace_groups(now, day_offsets=(0, 1))
+        meter.matched_pace_windows(groups, now_ts=now)
+        self.assertTrue(self._pace_cache_path.exists())
+        self._drop_pace_memory()
+        reloaded = meter.matched_pace_windows(groups, now_ts=tomorrow)
+        cold = self._cold_pace(groups, tomorrow)
+
+        self.assertEqual(reloaded, cold)
+
+    def test_matched_pace_rejects_incomplete_or_non_finite_persisted_entries(self):
+        now = datetime.datetime(2026, 8, 11, 12, 0, 0).timestamp()
+        groups = self._pace_groups(now)
+        expected = meter.matched_pace_windows(groups, now_ts=now)
+        stored = json.loads(self._pace_cache_path.read_text())
+
+        def corrupt_missing(entry):
+            entry["windows"].pop("today")
+            entry["windows"].pop("yesterday")
+
+        def corrupt_nan(entry):
+            entry["windows"]["today"]["coverage"] = float("nan")
+
+        def corrupt_infinite(entry):
+            entry["windows"]["all"]["pace_ratio"] = float("inf")
+
+        def corrupt_type(entry):
+            entry["windows"]["7"]["matched_pairs"] = "12"
+
+        for corrupt in (corrupt_missing, corrupt_nan, corrupt_infinite, corrupt_type):
+            with self.subTest(corruption=corrupt.__name__):
+                payload = json.loads(json.dumps(stored))
+                for entry in payload["pairs"]:
+                    corrupt(entry)
+                self._pace_cache_path.write_text(json.dumps(payload))
+                self._drop_pace_memory()
+                result = meter.matched_pace_windows(groups, now_ts=now)
+                self.assertEqual(result, expected)
+                self.assertEqual(meter._matched_pace_pair_cache_loaded, True)
+                self.assertEqual(len(meter._matched_pace_pair_cache), 3)
+
+    def test_matched_pace_ignores_an_undecodable_cache_file(self):
+        now = datetime.datetime(2026, 8, 11, 12, 0, 0).timestamp()
+        groups = self._pace_groups(now)
+        expected = self._cold_pace(groups, now)
+        self._pace_cache_path.write_bytes(b'{"schema": \xff\xfe\x80 }')
+        self._drop_pace_memory()
+
+        self.assertEqual(meter.matched_pace_windows(groups, now_ts=now), expected)
+
+    def test_project_scoped_matched_pace_leaves_the_global_pair_cache_intact(self):
+        now = datetime.datetime(2026, 8, 11, 12, 0, 0).timestamp()
+        global_groups = self._pace_groups(now, names=("alpha", "beta", "gamma", "delta"))
+        project_groups = {
+            name: rows[:15] for name, rows in global_groups.items()
+            if name in ("alpha", "beta")
+        }
+        first = meter.matched_pace_windows(global_groups, now_ts=now)
+        persisted = self._pace_cache_path.read_bytes()
+        project = meter.matched_pace_windows(
+            project_groups, now_ts=now, persistent=False,
+        )
+        self.assertEqual(self._pace_cache_path.read_bytes(), persisted)
+        self.assertEqual(project, self._cold_pace(project_groups, now))
+        # Restore the global in-memory state the cold check discarded.
+        self._drop_pace_memory()
+        meter.matched_pace_windows(global_groups, now_ts=now)
+        meter.matched_pace_windows(project_groups, now_ts=now, persistent=False)
+        meter._matched_pace_cache["signature"] = None
+
+        original = meter.matched_pace_comparison
+        with mock.patch.object(
+            meter, "matched_pace_comparison", wraps=original,
+        ) as comparison:
+            again = meter.matched_pace_windows(global_groups, now_ts=now)
+        self.assertEqual(comparison.call_count, 0)
+        self.assertEqual(again, first)
+        self.assertEqual(self._pace_cache_path.read_bytes(), persisted)
+
+    def test_project_model_stats_uses_the_non_persistent_pace_scope(self):
+        row = {
+            "id": "s", "project": "/repo/a", "provider": "codex",
+            "runtime": "Codex", "model_stats": [{
+                "model": "gpt-5.6", "cost": 1, "tokens": 100,
+                "input_tokens": 80, "output_tokens": 20, "executions": 1,
+            }],
+            "_model_daily": [], "_performance_samples": [], "_wait_samples": [],
+        }
+        saved_cache = dict(meter._xsess)
+        original = meter.matched_pace_windows
+        try:
+            meter._xsess.update({"internal_rows": (row,), "project_model_stats": {}})
+            with mock.patch.object(meter, "cross_session",
+                                   return_value={"generated_at": 1}), \
+                    mock.patch.object(meter, "matched_pace_windows",
+                                      wraps=original) as pace:
+                _, status = meter.project_model_stats("/repo/a")
+        finally:
+            meter._xsess.clear()
+            meter._xsess.update(saved_cache)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(pace.call_count, 1)
+        self.assertIs(pace.call_args.kwargs.get("persistent"), False)
+
+    def test_matched_pace_skips_the_write_when_no_pair_changed(self):
+        now = datetime.datetime(2026, 8, 11, 12, 0, 0).timestamp()
+        groups = self._pace_groups(now)
+        meter.matched_pace_windows(groups, now_ts=now)
+        self.assertTrue(self._pace_cache_path.exists())
+        # Force a rebuild that finds every pair already cached: a restart that
+        # reloads the file, then a changed whole-result signature.
+        self._drop_pace_memory()
+        with mock.patch.object(meter, "atomic_write_text") as write:
+            meter.matched_pace_windows(groups, now_ts=now)
+            meter._matched_pace_cache["signature"] = None
+            meter.matched_pace_windows(groups, now_ts=now)
+        write.assert_not_called()
+
+        changed = {**groups, "gamma": groups["gamma"][:-1]}
+        with mock.patch.object(meter, "atomic_write_text") as write:
+            meter.matched_pace_windows(changed, now_ts=now)
+        self.assertEqual(write.call_count, 1)
+
+    def test_matched_pace_pair_cache_is_bounded_on_load_and_in_memory(self):
+        now = datetime.datetime(2026, 8, 11, 12, 0, 0).timestamp()
+        groups = self._pace_groups(now, names=("alpha", "beta", "gamma", "delta"))
+        with mock.patch.object(meter, "MATCHED_PACE_CACHE_MAX_PAIRS", 2):
+            first = meter.matched_pace_windows(groups, now_ts=now)
+            self.assertEqual(len(meter._matched_pace_pair_cache), 2)
+            self.assertEqual(len(json.loads(
+                self._pace_cache_path.read_text())["pairs"]), 2)
+            self.assertEqual(first, self._cold_pace(groups, now))
+        meter._matched_pace_cache["signature"] = None
+        meter.matched_pace_windows(groups, now_ts=now)
+        stored = json.loads(self._pace_cache_path.read_text())
+        self.assertEqual(len(stored["pairs"]), 6)
+        with mock.patch.object(meter, "MATCHED_PACE_CACHE_MAX_PAIRS", 3):
+            self._drop_pace_memory()
+            with mock.patch.object(meter, "_build_matched_pace_windows",
+                                   return_value=({}, False)):
+                meter.matched_pace_windows(groups, now_ts=now)
+            self.assertEqual(len(meter._matched_pace_pair_cache), 3)
 
     def test_matched_pace_reports_ratio_confidence_and_coverage(self):
         def sample(duration, ts):
