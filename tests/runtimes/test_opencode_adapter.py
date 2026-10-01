@@ -216,16 +216,24 @@ class OpenCodeRuntimeAdapterTests(unittest.TestCase):
             "path": "opencode:session-1", "project": "/work/project", "mtime": 4.0,
             "signature_mtime": 4.0, "title": "A safe title", "model": "model-1",
             "model_provider": "models", "agent": "build", "tools_loaded": 0,
-            "agent_parent_id": "", "agent_role": "build", "agent_depth": 0,
-            "agent_has_children": True,
+            "agent_parent_id": "", "agent_root_id": "", "agent_role": "build",
+            "agent_depth": 0, "agent_has_children": True,
         })
         child = self._source("child", legacy=True)
         self.assertEqual(child["id"], "child")
         self.assertEqual(child["agent_parent_id"], "session-1")
+        self.assertEqual(child["agent_root_id"], "session-1")
         self.assertEqual(child["agent_depth"], 1)
         self.assertEqual(child["project"], "/work/project")
         self.assertFalse(child["agent_has_children"])
         self.assertTrue(root["agent_has_children"])
+
+    def test_archived_ancestor_excludes_descendants_from_discovery(self):
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.execute("UPDATE session SET time_archived=9000 WHERE id='session-1'")
+        rows = self.adapter.discover_legacy(DiscoveryContext(home=str(self.root)))
+
+        self.assertEqual(rows, ())
 
 
 if __name__ == "__main__":

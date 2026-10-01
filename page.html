@@ -801,9 +801,9 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
      <label class=filterControl><span>App</span><select class=filterSelect id=g-app aria-label="App filter"><option value="">All apps</option></select></label>
      <label class=filterControl><span>Projects</span><select class=filterSelect id=g-project aria-label="Projects filter"><option value="">All projects</option></select></label>
      <label class=filterControl><span>Time range</span><select class=filterSelect id=g-time aria-label="Time range filter"><option value=all>Any time</option><option value=24h>Last 24 hours</option><option value=7d>Last 7 days</option><option value=30d>Last 30 days</option><option value=90d>Last 90 days</option></select></label>
-     <div class="filterControl filterSort" role=radiogroup aria-label="Subagent run visibility"><span>Subagents</span><div class="seg sortseg" id=g-children>
-      <button type=button role=radio aria-checked=true data-gchildren=hide class=on title="Hide subagent runs. Their spend is still counted in totals and shown under each parent session.">Hidden</button>
-      <button type=button role=radio aria-checked=false data-gchildren=show title="Also list subagent runs as their own rows.">Listed</button>
+     <div class="filterControl filterSort"><span>Subagents</span><div class="seg sortseg" id=g-children aria-label="Subagent run visibility">
+      <button type=button aria-pressed=true data-gchildren=hide class=on title="Hide subagent runs as rows. Their spend is still counted in totals and shown under each parent session.">Hidden</button>
+      <button type=button aria-pressed=false data-gchildren=show title="Also list subagent runs as their own rows.">Listed</button>
      </div></div>
      <div class=filterClear><button class="tbtn clearFilters" id=g-clear type=button title="Clear search, app, project, and time filters.">Clear filters</button></div>
      <div class="filterControl filterSort"><span>Sort</span><div class="seg sortseg" id=g-sort>
@@ -2916,7 +2916,8 @@ let legacySessionBudgets={};
 const sessionBudgetWrites=new Map();
 try{legacySessionBudgets=JSON.parse(localStorage.getItem('tm_session_budgets')||'{}')||{};}catch(e){legacySessionBudgets={};}
 localStorage.removeItem('tm_budget');
-function budgetSessionKey(s){return String(s?.source?.id||s?.session||'unknown');}
+// A subagent run spends against its root session's cap, which the server names.
+function budgetSessionKey(s){return String(s?.session_budget?.id||s?.source?.id||s?.session||'unknown');}
 function saveLegacySessionBudgets(){try{localStorage.setItem('tm_session_budgets',JSON.stringify(legacySessionBudgets));}catch(e){}}
 function sessionBudgetForSession(s){
  const saved=parseFloat(s?.session_budget?.budget_usd);
@@ -3298,7 +3299,7 @@ function paintGlobalChildren(){
  [...$('g-children').querySelectorAll('button')].forEach(b=>{
   const on=(b.dataset.gchildren==='show')===globalShowChildren;
   b.classList.toggle('on',on);
-  b.setAttribute('aria-checked',on?'true':'false');
+  b.setAttribute('aria-pressed',on?'true':'false');
  });
 }
 $('g-children').onclick=event=>{
@@ -6181,7 +6182,7 @@ function renderFrustration(signals,sessions){
 function logRowRenderKey(s,active){
  // Child subagent rows are part of this row's content, so a change in the
  // children must invalidate the cached innerHTML.
- return JSON.stringify([active,sessionDeleteAvailable(s,renderedAllSessionActions),s.client,s.provider,s.label,s.title,s.project,s.last,s.start,s.wait_time,s.turns,s.cost,s.availability,s.models,s.model_identity,s.tokens,s.provenance,s.usage_basis,s.token_estimate,s.throughput,s.cost_approx,childAgentsFor(s).map(c=>[c.id,c.cost,c.tokens,c.title,c.last,c.child_agent_role,c.availability,c.models])]);
+ return JSON.stringify([active,sessionDeleteAvailable(s,renderedAllSessionActions),s.client,s.provider,s.label,s.title,s.project,s.last,s.start,s.wait_time,s.turns,s.cost,s.availability,s.models,s.model_identity,s.tokens,s.provenance,s.usage_basis,s.token_estimate,s.throughput,s.cost_approx,childAgentsFor(s).map(c=>[c.id,c.cost,c.tokens,c.title,c.last,c.child_agent_role,c.child_depth,c.availability,c.models])]);
 }
 function logRowContent(s){
  const rowCost=metricAvailable(s,'cost'),rowTokens=metricAvailable(s,'tokens'),localEstimate=hasLocalEstimate(s),avg=rowCost&&s.turns?money((s.cost||0)/s.turns)+estimateSuffix(s):'--';
@@ -6202,11 +6203,14 @@ function childAgentsFor(s){
  const children=childSessionMap.get(String(s?.id||''));
  return Array.isArray(children)?children:[];
 }
+function childRootId(row){return row?.is_child_session?String(row.root_session_id||''):'';}
 function indexChildSessions(rows){
+ // Every descendant is keyed by its root session, so a nested run still renders
+ // under the root card when its intermediate parent is itself a hidden child.
  childSessionMap=new Map();
  (rows||[]).forEach(row=>{
   if(!row?.is_child_session)return;
-  const key=String(row.child_parent_id||'');
+  const key=childRootId(row);
   if(!key)return;
   if(!childSessionMap.has(key))childSessionMap.set(key,[]);
   childSessionMap.get(key).push(row);
@@ -6234,7 +6238,8 @@ function childAgentSubsection(s){
   const role=child.child_agent_role?`<span class=subagentRole>${esc(child.child_agent_role)}</span>`:'';
   const roleText=child.child_agent_role||'Unreported role';
   const title=child.title||'Subagent run';
-  const detail=[roleText,(child.models||[]).join(', ')||child.primary_model||'--',child.last||''].filter(Boolean).join(' · ');
+  const depth=Number(child.child_depth)||1;
+  const detail=[roleText,depth>1?`nested depth ${f(depth)}`:'',(child.models||[]).join(', ')||child.primary_model||'--',child.last||''].filter(Boolean).join(' · ');
   const costHtml=childCost
    ?(child.cost>0?costValueHtml(money(child.cost)+(child.cost_approx?' est':''),true):`<span class=subagentZero title="Measured free-tier price">${money(0)}</span>`)
    :'<span class=subagentZero>cost unavailable</span>';
@@ -6659,7 +6664,7 @@ function renderSubagentExplorer(usage){
   const unresolved=Number(usage?.totals?.unresolved_agents)||0,unresolvedCost=Number(usage?.totals?.unresolved_known_cost)||0,coverageNote=$('subagent-coverage-note');
   coverageNote.hidden=!unresolved;
   coverageNote.innerHTML=unresolved
-   ?`<b>${f(unresolved)}</b> ${countWord(unresolved,'child run')} could not be attributed to a parent session${unresolvedCost?` (${money(unresolvedCost)} of covered spend)`:''}, usually because the parent session was archived or no longer available. ${unresolved===1?'It is':'They are'} counted in global totals, but the hierarchy and spend-share rollups above leave ${unresolved===1?'it':'them'} out.`
+   ?`<b>${f(unresolved)}</b> ${countWord(unresolved,'child run')} could not be attributed to a parent session${unresolvedCost?` (${money(unresolvedCost)} of covered spend)`:''} because the parent session record is missing from the local history. ${unresolved===1?'It is':'They are'} counted in global totals, but the hierarchy and spend-share rollups above leave ${unresolved===1?'it':'them'} out.`
    :'';
  if(selectedSubagentId&&!result.rows.some(row=>String(row?.id||'')===selectedSubagentId))selectedSubagentId='';
  const copy={issues:['Issues','Incomplete runs and cost/retry signals.'],sessions:['Parent sessions','Child runs grouped by parent. Cost color is relative within each session.'],roles:['Roles','']}[subagentView];
@@ -6882,6 +6887,48 @@ $('subagent-inspector').onclick=event=>{
  if(root){selectSession(root,{returnScope:'subagents'});return;}
  if(event.target.closest('[data-subagent-close-detail]')){selectedSubagentId='';renderSubagentExplorer(LATEST?.xsession?.agent_usage);}
 };
+function allSessionsView(all,{showChildren=false,app='',project='',rangeStart=0,query=''}={}){
+ const baseMatch=s=>{
+  if(app&&appFilterGroup(s)!==app)return false;
+  if(project&&projectFilterValue(s.project)!==project)return false;
+  if(rangeStart&&(s.mtime||0)<rangeStart)return false;
+  return true;
+ };
+ const textMatch=s=>!query||[s.title,s.project,s.provider,s.label,s.child_agent_role,(s.models||[]).join(' ')].join(' ').toLowerCase().includes(query);
+ const matching=(all||[]).filter(s=>baseMatch(s)&&textMatch(s));
+ const children=matching.filter(s=>s.is_child_session);
+ let rows=matching;
+ if(!showChildren){
+  // A matching child run surfaces its root card, so search still finds it.
+  const childRoots=new Set(children.map(childRootId).filter(Boolean));
+  rows=(all||[]).filter(s=>!s.is_child_session&&((baseMatch(s)&&textMatch(s))||childRoots.has(String(s.id))));
+ }
+ const statsIds=new Set(),statsRows=[];
+ [...matching,...rows].forEach(s=>{const id=String(s.id);if(!statsIds.has(id)){statsIds.add(id);statsRows.push(s);}});
+ const shownIds=new Set(rows.map(s=>String(s.id)));
+ const underParent=children.filter(s=>shownIds.has(childRootId(s))).length;
+ return {
+  rows,statsRows,showChildren,
+  total:(all||[]).filter(s=>showChildren||!s.is_child_session).length,
+  children:children.length,
+  childCost:children.filter(s=>metricAvailable(s,'cost')).reduce((a,b)=>a+(b.cost||0),0),
+  underParent,
+  unparented:children.length-underParent,
+ };
+}
+function allSessionsCountText(view){
+ const statsRows=view.statsRows,rows=view.rows;
+ const cost=statsRows.reduce((a,b)=>a+(b.cost||0),0),localEstimates=statsRows.filter(row=>hasLocalEstimate(row)&&metricAvailable(row,'cost')).length,costCovered=statsRows.filter(row=>metricAvailable(row,'cost')).length;
+ // Hidden subagent runs are still counted in totals, so report how many of the
+ // matching runs sit under a shown parent card and how many have no parent.
+ const parentNote=view.unparented
+  ?`${f(view.underParent)} shown under parent cards · ${f(view.unparented)} with no parent session`
+  :'listed under parents';
+ const childNote=!view.showChildren&&view.children
+  ?` · includes ${f(view.children)} subagent ${countWord(view.children,'run')} (${money(view.childCost)}) counted, ${parentNote}`
+  :'';
+ return `${f(rows.length)} of ${f(view.total)} sessions · ${money(cost)} covered spend · ${f(costCovered)} of ${f(statsRows.length)} cost-covered${localEstimates?` · includes ${f(localEstimates)} Cursor local ${countWord(localEstimates,'estimate')}`:''}${childNote}`;
+}
 function renderAllSessions(xs){
  if(!xs)return;
  const generatedAt=Number(xs.generated_at||0);
@@ -6925,14 +6972,11 @@ function renderAllSessions(xs){
  const q=globalSearch.trim().toLowerCase();
  const rangeSeconds={all:0,'24h':86400,'7d':604800,'30d':2592000,'90d':7776000}[globalTime]||0;
  const rangeStart=rangeSeconds?Date.now()/1000-rangeSeconds:0;
- let sessions=all.filter(s=>{
-   if(!globalShowChildren&&s.is_child_session)return false;
-   if(globalApp&&appFilterGroup(s)!==globalApp)return false;
-   if(globalProject&&projectFilterValue(s.project)!==globalProject)return false;
-   if(rangeStart&&(s.mtime||0)<rangeStart)return false;
-   return !q||[s.title,s.project,s.provider,s.label,(s.models||[]).join(' ')].join(' ').toLowerCase().includes(q);
-  });
- renderAllSessionStats(sessions);
+ const view=allSessionsView(all,{showChildren:globalShowChildren,app:globalApp,project:globalProject,rangeStart,query:q});
+ let sessions=view.rows;
+ // Header stats count every matching run, so hiding subagent rows never removes
+ // their spend from the figures that the Hidden control says are still counted.
+ renderAllSessionStats(view.statsRows);
  const sorters={
    recent:(a,b)=>(b.mtime||0)-(a.mtime||0),
    cost:(a,b)=>(b.cost||0)-(a.cost||0)||(b.mtime||0)-(a.mtime||0),
@@ -6941,23 +6985,7 @@ function renderAllSessions(xs){
 	  wait:(a,b)=>Number(b.wait_time?.total_s||0)-Number(a.wait_time?.total_s||0)||(b.mtime||0)-(a.mtime||0),
  };
  sessions=sessions.slice().sort(sorters[globalSort]||sorters.recent);
- const shownCost=sessions.reduce((a,b)=>a+(b.cost||0),0),localEstimates=sessions.filter(row=>hasLocalEstimate(row)&&metricAvailable(row,'cost')).length,costCovered=sessions.filter(row=>metricAvailable(row,'cost')).length;
- // Hidden subagent runs are still counted in totals, so report them separately
- // instead of letting the row count imply they were excluded from spend.
- const hiddenChildren=all.filter(s=>s.is_child_session).length;
- const hiddenChildCost=all.filter(s=>s.is_child_session&&metricAvailable(s,'cost')).reduce((a,b)=>a+(b.cost||0),0);
- // A hidden child run with no parent row in the list belongs to a session that
- // was not discovered (usually archived), so it is counted but not listed under
- // a parent. Say so instead of claiming every hidden run sits under a parent.
- const listedIds=new Set(all.map(s=>String(s.id)));
- const unparentedChildren=all.filter(s=>s.is_child_session&&!(s.child_parent_id&&listedIds.has(String(s.child_parent_id)))).length;
- const parentNote=unparentedChildren
-  ?`${f(hiddenChildren-unparentedChildren)} shown under parent cards · ${f(unparentedChildren)} with no parent session`
-  :'listed under parents';
- const hiddenNote=!globalShowChildren&&hiddenChildren
-  ?` · ${f(hiddenChildren)} subagent ${countWord(hiddenChildren,'run')} (${money(hiddenChildCost)}) counted, ${parentNote}`
-  :'';
- setLogText($('g-count'),`${f(sessions.length)} of ${f(all.length)} sessions · ${money(shownCost)} covered spend · ${f(costCovered)} of ${f(sessions.length)} cost-covered${localEstimates?` · includes ${f(localEstimates)} Cursor local ${countWord(localEstimates,'estimate')}`:''}${hiddenNote}`);
+ setLogText($('g-count'),allSessionsCountText(view));
  const maxCost=Math.max(.001,...sessions.map(s=>s.cost||0));
  reconcileLogRows(sessions,maxCost,liveSessionIds);
 }

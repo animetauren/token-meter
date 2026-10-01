@@ -53,11 +53,14 @@ verified against real data rather than assumed.
 - **Message sets are disjoint.** A query for child message ids present in the
   parent session returns zero rows. There is no repeated logical message and so
   nothing to deduplicate.
-- **Nesting is exactly one level.** A recursive grandchild query returns zero
-  rows, so depth resolution beyond 1 is unnecessary.
+- **Nesting is shallow.** A recursive grandchild query returned zero rows on
+  the measured data, but the schema allows deeper chains, so the adapter
+  resolves each session's root ancestor and depth with a bounded walk
+  (`MAX_SESSION_ANCESTRY`, cycle-safe) instead of assuming depth 1.
 - **No orphaned children.** Every non-null `parent_id` resolves to a live
   session.
-- **No archived children**, so no child contributes a stale nonterminal state.
+- **No archived children** on the measured data. Archive semantics apply to a
+  whole family: an archived session and every descendant are excluded together.
 
 Because the parent does not include child spend, the Claude and Codex treatment
 of excluding children from top-level discovery would leave OpenCode
@@ -87,7 +90,8 @@ individually counted sessions.
 
 - Adding subagent support for Cursor, Kiro, Pi, or Hermes.
 - Inferring an agent role from prompt text, message content, or a tool argument.
-- Nesting beyond depth 1, or repairing a cycle heuristically.
+- Repairing a cycle or an over-deep chain heuristically; such a family is left
+  unresolved and its sessions stay individually counted.
 - Treating `message.data.parentID` as a session relationship. That field is a
   message-level reference: 26,901 messages carry it and none match a session id.
   Parent linkage comes only from `session.parent_id`.
@@ -116,12 +120,13 @@ characters. It is provider-reported structural metadata, never derived from
 content. Where it is empty the record carries no role and the browser shows its
 existing unreported-role treatment.
 
-`kind` is `spawned` and `depth` is 1. A child whose parent session is missing
-from discovery produces no edge and remains a standalone counted session, which
-is the conservative outcome the existing domain layer already implements.
+`kind` is `spawned` and `depth` is the resolved nesting depth (1 for a direct
+child, 2 for a grandchild). A child whose parent session record is missing
+produces no edge and remains a standalone counted session, which is the
+conservative outcome the existing domain layer already implements.
 
-`project` for a child resolves from the parent root's directory, not the child's
-own `agent` column. The adapter uses `agent` only as a last-resort project
+`project` for a child resolves from the root ancestor's directory, not the
+immediate parent's directory and not the child's own `agent` column. The adapter uses `agent` only as a last-resort project
 fallback, and letting a child fall back to a project literally named
 `gsd-planner` would be a defect. On the current data every session has a
 non-empty `directory`, so the fallback does not trigger.
@@ -129,9 +134,11 @@ non-empty `directory`, so the fallback does not trigger.
 ## Data Flow
 
 1. The adapter query selects child sessions alongside roots, additionally
-   selecting `parent_id` and `agent`, and sets a per-session
-   `_aggregation_key` so no child collapses into a parent and no root collapses
-   a child. `time_archived IS NULL` is retained.
+   selecting `parent_id` and `agent`. A lightweight ancestry query over every
+   session (archived included) resolves each session's root, depth, and root
+   directory. A session is excluded when it or any ancestor is archived, so an
+   archived root removes its whole family from discovery and totals, matching
+   pre-change behavior.
 2. `discover` and `discover_legacy` emit one source per session, roots and
    children alike, carrying the parent reference privately.
 3. `canonical_aggregation_sources` keeps each OpenCode session distinct, so
@@ -140,9 +147,13 @@ non-empty `directory`, so the fallback does not trigger.
 5. `canonical_agent_sources` gains an OpenCode branch that selects exactly one
    summary per physical child, without altering accounting sources.
 6. The existing runtime-neutral domain layer builds groups, totals, cohorts, and
-   attention signals unchanged. No domain change is required.
+   attention signals unchanged. The only domain addition is the runtime-neutral
+   current-session fold described below.
 7. The public projection adds only the bounded child fields the subsection
-   renders. MCP, native, and telemetry payloads are unchanged.
+   renders: `is_child_session`, `child_agent_role`, `child_depth`, and
+   `root_session_id` (present only when the root resolved; the root is itself a
+   discovered, listed session). The raw `parent_id` is never published, so an
+   unlisted or missing parent reference never leaves the server.
 8. `page.html` filters child rows from the default list and renders a child
    subsection inside the parent card.
 
@@ -151,8 +162,8 @@ non-empty `directory`, so the fallback does not trigger.
 - A child whose parent is absent produces no agent edge and stays a counted
   standalone session.
 - An unattributed child is disclosed, not silent. A child whose parent session
-  was never discovered (for example an archived parent) is counted in global
-  totals but has no group, so the Subagents rollup would otherwise look
+  record is missing from the local database is counted in global totals but has
+  no group, so the Subagents rollup would otherwise look
   complete while excluding it. The loader reports the count and covered cost of
   those records, the browser states them on the Subagents page, and the All
   sessions row-count line separates runs shown under a parent card from runs
@@ -167,6 +178,37 @@ non-empty `directory`, so the fallback does not trigger.
 - One adapter failure cannot suppress Claude, Codex, or Kiro agent statistics.
 - Public errors and warnings contain no session id, path, or provider content.
 
+## Additive Cost Guard
+
+Headline totals assume `session.cost` of a parent excludes its children, so the
+family headline is parent plus children. A test pins this against message-level
+evidence. As a defensive check, a parent with children is treated as inclusive
+when its reported cost reaches its own assistant-message cost plus its direct
+non-archived children's cost (within 0.5% of the children's cost); its own
+share then becomes the reported cost minus those children, so a future
+inclusive OpenCode build cannot double count. Without message-level cost
+evidence for the parent the reported cost is kept unchanged. The adjustment
+applies to summary and detail paths and is marked privately on the summary row; the native
+`SessionSource` load path keeps the reported cost because it carries no family
+evidence.
+
+## Current Sessions And Session Caps
+
+A child run is part of its root session's live work, not a separate current
+session. `current_session_summaries` folds each child with a resolved root into
+the root's row: cost, tokens, and executions are summed, `subagent_runs` counts
+the folded runs, and the newest child activity becomes the row's activity, so a
+root whose own messages are idle still appears current while a descendant
+works. A child whose root row is absent (unresolved family, or a root with no
+executions) stays its own row so its spend is never hidden. The same rule
+applies to the watcher's live source, menu-bar recent sessions, implicit MCP
+run selection, and the `/session` live flag.
+
+A child run has no separate cap. `session_budget_snapshot` reports the root's
+cap for every family member, and its spend is the live session's spend plus the
+cached spend of every other family member. Setting a cap from a child, through
+HTTP or MCP, writes the root's override.
+
 ## Compatibility
 
 Existing session ids, routes, deep links, budgets, and stored browser
@@ -179,20 +221,24 @@ dashboard order is unchanged.
 
 Red-green-refactor. Focused fixtures must prove:
 
-1. Child sessions are discovered and raise totals by exactly their own cost.
+1. Child sessions are discovered and raise totals by exactly their own cost,
+   and an archived root excludes its children and grandchildren.
 2. Total equals root cost plus child cost, with no double counting, proven
    against a fixture whose parent cost is lower than its children's sum.
-3. Each child produces one `spawned` agent record at depth 1 whose cost and
+3. Each child produces one `spawned` agent record at its resolved depth whose cost and
    token fields equal its session row.
 4. Parent agent identity is an opaque digest, never a raw session id.
-5. A child with a missing parent stays a counted standalone session and creates
-   no edge.
+5. A child with a missing parent stays a counted standalone session, creates
+   no edge, and is the only source of unresolved disclosure.
+5a. A grandchild resolves its root's project, depth 2, and root session id.
+5b. Root, active child, and grandchild form one current session and one cap.
 6. A free-tier child reporting tokens with `cost=0` reports a measured zero
    with cost available, and is never shown as unpriced.
 7. `parent_id`, `directory`, `slug`, and prompt, tool, or part content never
    reach the browser, MCP, native, or telemetry projections.
-8. Children are absent from the default All sessions list but present in totals
-   and in the parent card subsection.
+8. Children are absent from the default All sessions list but present in totals,
+   header stats, filter-aware row-count notes, search (by surfacing the root
+   card), and the root card subsection, including nested runs.
 9. Existing Claude, Codex, and Kiro agent-record contracts are unchanged.
 10. OpenCode agent statistics appear in the Subagents page cohorts with correct
     runtime scoping.

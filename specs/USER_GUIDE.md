@@ -196,8 +196,15 @@ spend is counted and listed under parents. Each parent session card carries a
 **Subagents** subsection showing its child runs inline with the reported role,
 model, tokens, and cost; selecting one opens that run like any other session. Use
 the **Subagents** filter, set to **Hidden** or **Listed**, to include child runs as
-their own rows. A child run priced at $0.00 on a free tier shows a measured zero
-rather than missing billing.
+their own rows. The All sessions header figures include child-run spend in both
+modes, and searching in **Hidden** mode finds a child run by showing its parent
+session card. Nested runs appear under their top-level session. A child run
+priced at $0.00 on a free tier shows a measured zero rather than missing billing.
+Archiving an OpenCode session removes it and its child runs from Token Meter.
+
+While a child run is active, it appears as part of its parent's current session:
+the parent's live cost and session cap include every child run, and a child run
+has no separate cap.
 
 Session deletion is available only where the runtime and platform expose a
 safe, recoverable target.

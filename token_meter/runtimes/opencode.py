@@ -38,6 +38,12 @@ from token_meter.domain.usage import (
 
 DETAIL_MESSAGE_LIMIT = 200
 SUMMARY_MESSAGE_LIMIT = 500
+# Bound for walking session.parent_id chains. Real nesting is shallow; the bound
+# keeps a malformed or cyclic chain from costing more than a few lookups.
+MAX_SESSION_ANCESTRY = 32
+# Relative tolerance used when deciding whether a parent's reported cost already
+# includes its children's cost.
+INCLUSIVE_COST_TOLERANCE = 0.005
 
 
 def _compact_text(value, limit=90):
@@ -206,6 +212,44 @@ def opaque_agent_id(session_id):
     return "opencode-agent-" + digest
 
 
+def session_lineage(session_id, ancestry, max_depth=MAX_SESSION_ANCESTRY):
+    """Resolve one session's family from `{id: (parent_id, directory, archived)}`.
+
+    Returns the resolved root id (empty for a root session or when the chain
+    cannot reach a true root), the nesting depth, the root ancestor's directory,
+    and whether the session or any ancestor is archived. A missing parent, a
+    cycle, or a chain longer than `max_depth` leaves the family unresolved.
+    """
+    own = ancestry.get(session_id) or ("", "", False)
+    parent, directory, archived = own
+    depth = 0
+    seen = {session_id}
+    top_directory = directory
+    resolved = not parent
+    current = parent
+    while current:
+        depth += 1
+        if current in seen or depth > max_depth or current not in ancestry:
+            break
+        seen.add(current)
+        next_parent, next_directory, next_archived = ancestry[current]
+        if next_archived:
+            archived = True
+            break
+        top_directory = next_directory or top_directory
+        if not next_parent:
+            resolved = True
+            break
+        current = next_parent
+    root_id = current if parent and resolved and not archived else ""
+    return {
+        "root_id": root_id,
+        "depth": depth,
+        "directory": top_directory,
+        "archived": bool(archived),
+    }
+
+
 class OpenCodeRuntimeAdapter:
     """Own OpenCode discovery, revision, safe loading, and legacy projection."""
 
@@ -301,58 +345,73 @@ class OpenCodeRuntimeAdapter:
     def _query_source_records(self):
         try:
             with contextlib.closing(self.connection()) as connection:
+                # Lightweight ancestry for every session, archived or not, so a
+                # descendant of an archived session can be excluded with it.
+                ancestry_rows = connection.execute(
+                    "SELECT id, parent_id, COALESCE(directory,''), "
+                    "time_archived IS NOT NULL FROM session"
+                ).fetchall()
                 rows = connection.execute(
                     "SELECT s.id, s.directory, COALESCE(s.title,''), "
                     "COALESCE(s.agent,''), COALESCE(s.model,''), "
                     "s.parent_id, "
                     "s.time_created, s.time_updated, "
-                    "(SELECT COUNT(*) FROM session c "
-                    "WHERE c.parent_id = s.id AND c.time_archived IS NULL) "
-                    "AS child_count, "
-                    "COALESCE(p.directory,'') AS parent_directory, "
                     "MAX(COALESCE(s.time_updated,0), "
                     "COALESCE((SELECT MAX(m.time_updated) FROM message m "
                     "WHERE m.session_id=s.id),0), "
                     "COALESCE((SELECT MAX(p.time_updated) FROM part p "
                     "WHERE p.session_id=s.id),0)) "
                     "FROM session s "
-                    "LEFT JOIN session p ON p.id = s.parent_id "
                     "WHERE s.time_archived IS NULL "
                     "ORDER BY s.time_updated DESC"
                 ).fetchall()
         except (OSError, sqlite3.Error):
             return None
+        ancestry = {
+            str(sid): (str(parent or ""), str(directory or ""), bool(archived))
+            for sid, parent, directory, archived in ancestry_rows
+        }
+        lineages = {}
+        for row in rows:
+            lineages[str(row[0])] = session_lineage(str(row[0]), ancestry)
+        # A session archived as part of an archived family is excluded together
+        # with every descendant, matching OpenCode's own archive semantics.
+        kept = {sid for sid, lineage in lineages.items() if not lineage["archived"]}
+        parents_with_children = {
+            ancestry[sid][0] for sid in kept if ancestry.get(sid, ("",))[0]
+        }
         records = []
         for (
             sid, directory, title, agent, raw_model, parent_id,
-            created, updated, child_count, parent_directory, revision,
+            created, updated, revision,
         ) in rows:
+            sid = str(sid)
+            if sid not in kept:
+                continue
+            lineage = lineages[sid]
             model = _json_object(raw_model, {}) or {}
             title = str(title or "")
             if title.startswith("New session") or not title.strip():
                 title = ""
             parent = str(parent_id or "")
-            project_directory = (
-                str(parent_directory or "")
-                if parent else ""
-            ) or str(directory or "")
             records.append({
-                "id": str(sid),
+                "id": sid,
                 "directory": str(directory or ""),
                 "title": _compact_text(title) or None,
                 "agent": str(agent or ""),
                 "model": str(model.get("id") or "unknown"),
                 "model_provider": str(model.get("providerID") or ""),
                 "parent_id": parent,
-                "project_directory": project_directory,
+                "root_id": lineage["root_id"],
+                "depth": lineage["depth"],
+                "project_directory": lineage["directory"] or str(directory or ""),
                 "is_child": bool(parent),
-                "has_children": bool(child_count),
+                "has_children": sid in parents_with_children,
                 "created": _seconds(created),
                 "updated": _seconds(updated),
                 "revision": _seconds(revision),
             })
         return tuple(records)
-
 
     def _records(self):
         signature = self._database_signature()
@@ -386,7 +445,7 @@ class OpenCodeRuntimeAdapter:
         return tuple(sources)
 
     def _project_for_record(self, record):
-        """Resolve a session's project, scoping children to their parent root."""
+        """Resolve a session's project, scoping children to their root ancestor."""
         directory = record.get("project_directory") or record.get("directory")
         return (
             self._project_resolver(directory)
@@ -411,8 +470,9 @@ class OpenCodeRuntimeAdapter:
             "model_provider": record["model_provider"],
             "agent": record["agent"],
             "agent_parent_id": record["parent_id"],
+            "agent_root_id": record["root_id"],
             "agent_role": safe_agent_role(record["agent"]),
-            "agent_depth": 1 if record["is_child"] else 0,
+            "agent_depth": int(record["depth"]),
             "agent_has_children": bool(record["has_children"]),
             "tools_loaded": 0,
         } for record in self._records())
@@ -865,6 +925,8 @@ class OpenCodeRuntimeAdapter:
             "cache_read": int(s_cr or 0), "output": int(s_output or 0),
         }
         s_cost_val = float(s_cost or 0.0)
+        if source.get("agent_has_children"):
+            s_cost_val, _inclusive = self._exclusive_cost(sid, s_cost)
         total_cost = s_cost_val
         total_tokens = sum(tot.values()) + int(s_reasoning or 0)
         full_cost_breakdown = distribute_cost(total_cost, {
@@ -986,6 +1048,11 @@ class OpenCodeRuntimeAdapter:
             )
         s_input, s_output, s_reasoning, s_cr, s_cw, s_cost, s_model_raw, created, updated = row
         s_cost_val = float(s_cost or 0.0)
+        cost_includes_children = False
+        if source.get("agent_has_children"):
+            s_cost_val, cost_includes_children = self._exclusive_cost(
+                sid, s_cost, connection=connection,
+            )
         inp = int(s_input or 0)
         out = int(s_output or 0)
         reasoning = int(s_reasoning or 0)
@@ -1255,14 +1322,20 @@ class OpenCodeRuntimeAdapter:
         row["terminal"] = False
         row["_tool_evidence"] = summarize_tool_evidence(tool_evidence)
         # Mark a child session so the browser can keep it out of the default
-        # session list while still counting its spend. The public parent session
-        # id lets the parent card render its own children inline.
+        # session list while still counting its spend. Only the resolved root
+        # session id is published: it is itself a discovered, listed session, so
+        # the raw (possibly unlisted) parent reference never leaves the server.
         if source.get("agent_parent_id"):
             row["is_child_session"] = True
-            row["child_parent_id"] = str(source.get("agent_parent_id") or "")
+            root_id = str(source.get("agent_root_id") or "")
+            if root_id:
+                row["root_session_id"] = root_id
+            row["child_depth"] = max(1, int(source.get("agent_depth") or 1))
             row["child_agent_role"] = safe_agent_role(
                 source.get("agent_role")
             ) or None
+        if cost_includes_children:
+            row["_cost_includes_children"] = True
         signal_rollups, signal_events = analyze_language_signal_turns(signal_turns)
         attach_language_signals(row, signal_rollups, signal_events)
         agent_records = self._agent_record_for(
@@ -1276,6 +1349,59 @@ class OpenCodeRuntimeAdapter:
         if agent_records:
             row["_agent_records"] = agent_records
         return row
+
+    def _exclusive_cost(self, session_id, reported_cost_value, connection=None):
+        """Return a parent's own cost and whether it already included children.
+
+        OpenCode reports a parent's session cost exclusive of its child sessions,
+        and totals rely on that: the headline is parent plus children. If a
+        future OpenCode build reported an inclusive parent cost, adding children
+        would double count. A parent is treated as inclusive only when its
+        reported cost reaches its own message-level cost plus its direct
+        children's cost (within a small tolerance) while children carry cost;
+        its own share is then the reported cost minus those children. Without
+        message-level cost evidence the reported cost is kept unchanged.
+        """
+        if (
+            isinstance(reported_cost_value, bool)
+            or not isinstance(reported_cost_value, (int, float))
+            or not math.isfinite(float(reported_cost_value))
+        ):
+            return float(reported_cost_value or 0.0), False
+        reported = float(reported_cost_value)
+        conn = connection if isinstance(connection, sqlite3.Connection) else None
+        owns_connection = conn is None
+        try:
+            if conn is None:
+                conn = self.connection()
+            child_row = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(cost),0) FROM session "
+                "WHERE parent_id=? AND time_archived IS NULL "
+                "AND typeof(cost) IN ('real','integer')",
+                (session_id,),
+            ).fetchone()
+            own_row = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(json_extract(data,'$.cost')),0) "
+                "FROM message WHERE session_id=? "
+                "AND json_extract(data,'$.role')='assistant' "
+                "AND json_type(data,'$.cost') IN ('real','integer')",
+                (session_id,),
+            ).fetchone()
+        except (OSError, sqlite3.Error):
+            return reported, False
+        finally:
+            if owns_connection and conn is not None:
+                conn.close()
+        child_count, child_cost = int(child_row[0] or 0), float(child_row[1] or 0.0)
+        own_count, own_cost = int(own_row[0] or 0), float(own_row[1] or 0.0)
+        if not child_count or child_cost <= 1e-9 or not own_count:
+            return reported, False
+        # Scale the tolerance by the children's cost so a small child under a
+        # large parent never makes an exclusive parent look inclusive.
+        tolerance = max(1e-6, INCLUSIVE_COST_TOLERANCE * child_cost)
+        if reported + tolerance >= own_cost + child_cost:
+            return max(0.0, reported - child_cost), True
+        return reported, False
 
     def _agent_record_for(
         self, source, row, *, cost_value, cost_available, tokens_available,
@@ -1324,7 +1450,7 @@ class OpenCodeRuntimeAdapter:
             "runtime": "opencode",
             "client": "OpenCode",
             "kind": "spawned" if is_child else "root",
-            "depth": 1 if is_child else 0,
+            "depth": max(1, int(source.get("agent_depth") or 1)) if is_child else 0,
             "label": "",
             "role": role or None,
             "model": model,

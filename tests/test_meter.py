@@ -9755,17 +9755,18 @@ console.log(JSON.stringify({
         self.assertLess(self.page.index("id=g-clear"), self.page.index("id=g-sort"))
         for value in ("value=24h", "value=7d", "value=30d", "value=90d"):
             self.assertIn(value, self.page)
-        self.assertIn("globalApp&&appFilterGroup(s)!==globalApp", self.page)
+        self.assertIn("allSessionsView(all,{showChildren:globalShowChildren,app:globalApp,project:globalProject,rangeStart,query:q})", self.page)
+        self.assertIn("if(app&&appFilterGroup(s)!==app)return false;", self.page)
         self.assertIn("const appFilterGroup=session=>runtimeId(session)", self.page)
         self.assertIn("const appFilterLabel=session=>runtimeMeta(session).label", self.page)
         self.assertIn("['claude_code','claude_desktop'].includes(globalApp)", self.page)
-        self.assertIn("globalProject&&projectFilterValue(s.project)!==globalProject", self.page)
+        self.assertIn("if(project&&projectFilterValue(s.project)!==project)return false;", self.page)
         self.assertIn("Other local sessions", self.page)
         self.assertIn("Date.now()/1000-rangeSeconds", self.page)
         self.assertIn("tm_global_app", self.page)
         self.assertIn("tm_global_project", self.page)
         self.assertIn("tm_global_time", self.page)
-        self.assertIn("renderAllSessionStats(sessions)", self.page)
+        self.assertIn("renderAllSessionStats(view.statsRows)", self.page)
         self.assertIn("session.model_stats", self.page)
         self.assertIn("globalSearch='';globalApp='';globalProject='';globalTime='all'", self.page)
         self.assertIn("['tm_global_search','tm_global_app','tm_global_project','tm_global_time']", self.page)
@@ -15959,36 +15960,255 @@ class OpenCodeTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in rows], ["ses_top"])
         self.assertFalse(rows[0].get("_agent_records"))
 
+    def _assistant(self, conn, mid, sid, cost, created, inp=10, out=5):
+        conn.execute("INSERT INTO message VALUES (?,?,?,?,?)", (
+            mid, sid, created, created + 500, json.dumps({
+                "role": "assistant", "modelID": "model-a", "providerID": "opencode-go",
+                "time": {"created": created, "completed": created + 500},
+                "tokens": {"input": inp, "output": out, "reasoning": 0,
+                           "cache": {"read": 0, "write": 0}},
+                "cost": cost,
+            }),
+        ))
+
+    def _family_db(self, root, base, rows, messages=True):
+        """Insert sessions plus one assistant message carrying each row's cost."""
+        conn = self._build_db(root)
+        self._insert_sessions(conn, rows)
+        if messages:
+            for index, row in enumerate(rows):
+                self._assistant(conn, "m-" + row["id"], row["id"], row["cost"],
+                                base + index)
+        conn.commit()
+        conn.close()
+        return root / "opencode.db"
+
+    def _cross(self, db_path, sources=None):
+        saved = dict(meter._xsess)
+        try:
+            meter._xsess["data"], meter._xsess["at"] = None, 0
+            meter._summary_cache.clear()
+            with mock.patch.object(meter, "OPENCODE_DB", str(db_path)), \
+                    mock.patch.object(meter, "capability_inventory", return_value={}):
+                sources = meter.opencode_session_sources() if sources is None else sources
+                cross = meter.cross_session(sources=sources)
+                family_rows = list(meter._xsess.get("sessions") or [])
+            return sources, cross, family_rows
+        finally:
+            meter._xsess.clear()
+            meter._xsess.update(saved)
+            meter._summary_cache.clear()
+
     def test_child_parent_id_stays_out_of_allowlisted_projections(self):
-        """The parent-child link must not reach MCP or the Subagents page."""
+        """Raw parent linkage never reaches sessions, /logs rows, or Subagents."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            conn = self._build_db(root)
             base = 1_784_548_900_000
             parent = self._session_row("ses_top", "/repo", "Root", "model-a",
                                        0.5, 100, 20, 0, 0, 0, base)
             child = self._session_row("ses_child", "/repo", "Child", "model-a",
                                       0.75, 300, 60, 0, 0, 0, base + 1000,
                                       parent_id="ses_top", agent="explore")
+            orphan = self._session_row("ses_orphan", "/repo", "Orphan", "model-a",
+                                       0.25, 30, 6, 0, 0, 0, base + 2000,
+                                       parent_id="ses_private_missing", agent="explore")
+            db_path = self._family_db(root, base, (parent, child, orphan))
+            _sources, cross, family_rows = self._cross(db_path)
+
+        by_id = {row["id"]: row for row in cross["sessions"]}
+        public = json.dumps({
+            "sessions": cross["sessions"], "family": family_rows,
+            "agent_usage": agent_usage_projection(cross["agent_usage"]),
+        }, default=str)
+        self.assertNotIn("child_parent_id", public)
+        # The unlisted parent reference of an orphan never leaves the server.
+        self.assertNotIn("ses_private_missing", public)
+        # Only the resolved, listed root id is published on a child row.
+        self.assertEqual(by_id["ses_child"]["root_session_id"], "ses_top")
+        self.assertTrue(by_id["ses_child"]["is_child_session"])
+        self.assertNotIn("root_session_id", by_id["ses_orphan"])
+        self.assertNotIn("root_session_id", by_id["ses_top"])
+
+    def test_archived_root_excludes_its_whole_family_from_totals(self):
+        """An archived root hides its children and grandchildren, as before."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = 1_784_548_900_000
+            rows = (
+                self._session_row("ses_arch", "/old", "Archived", "model-a",
+                                  1.00, 10, 5, 0, 0, 0, base, archived=base + 9000),
+                self._session_row("ses_arch_child", "/old", "Archived child", "model-a",
+                                  2.00, 10, 5, 0, 0, 0, base + 1000,
+                                  parent_id="ses_arch", agent="explore"),
+                self._session_row("ses_arch_grand", "/old", "Archived grandchild", "model-a",
+                                  4.00, 10, 5, 0, 0, 0, base + 2000,
+                                  parent_id="ses_arch_child", agent="explore"),
+                self._session_row("ses_live", "/repo", "Live", "model-a",
+                                  0.50, 10, 5, 0, 0, 0, base + 3000),
+                self._session_row("ses_live_child", "/repo", "Live child", "model-a",
+                                  0.25, 10, 5, 0, 0, 0, base + 4000,
+                                  parent_id="ses_live", agent="explore"),
+            )
+            db_path = self._family_db(root, base, rows)
+            sources, cross, _family = self._cross(db_path)
+
+        ids = sorted(row["id"] for row in sources)
+        self.assertEqual(ids, ["ses_live", "ses_live_child"])
+        self.assertAlmostEqual(cross["total_cost"], 0.75)
+        self.assertEqual(cross["total_sessions"], 2)
+        # Nothing is left looking like an unattributed child of an archived parent.
+        self.assertEqual(cross["agent_usage"]["totals"]["unresolved_agents"], 0)
+        self.assertNotIn("ses_arch", json.dumps(cross["sessions"]))
+
+    def test_missing_parent_is_the_only_unresolved_family(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = 1_784_548_900_000
+            rows = (
+                self._session_row("ses_live", "/repo", "Live", "model-a",
+                                  0.50, 10, 5, 0, 0, 0, base),
+                self._session_row("ses_orphan", "/repo", "Orphan", "model-a",
+                                  0.40, 10, 5, 0, 0, 0, base + 1000,
+                                  parent_id="ses_gone", agent="explore"),
+            )
+            db_path = self._family_db(root, base, rows)
+            _sources, cross, _family = self._cross(db_path)
+
+        self.assertAlmostEqual(cross["total_cost"], 0.90)
+        self.assertEqual(cross["agent_usage"]["totals"]["unresolved_agents"], 1)
+        self.assertAlmostEqual(
+            cross["agent_usage"]["totals"]["unresolved_known_cost"], 0.40,
+        )
+
+    def test_grandchild_resolves_root_project_depth_and_root_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = 1_784_548_900_000
+            rows = (
+                self._session_row("ses_root", "/repo/root", "Root", "model-a",
+                                  0.50, 10, 5, 0, 0, 0, base),
+                self._session_row("ses_mid", "/repo/mid", "Mid", "model-a",
+                                  0.25, 10, 5, 0, 0, 0, base + 1000,
+                                  parent_id="ses_root", agent="explore"),
+                self._session_row("ses_leaf", "/repo/leaf", "Leaf", "model-a",
+                                  0.125, 10, 5, 0, 0, 0, base + 2000,
+                                  parent_id="ses_mid", agent="gsd-reviewer"),
+            )
+            db_path = self._family_db(root, base, rows)
+            sources, cross, _family = self._cross(db_path)
+            with mock.patch.object(meter, "OPENCODE_DB", str(db_path)):
+                meter._summary_cache.clear()
+                by_source = {row["id"]: row for row in sources}
+                leaf_record = self._child_agent_row(by_source["ses_leaf"])
+                meter._summary_cache.clear()
+
+        by_source = {row["id"]: row for row in sources}
+        self.assertEqual(by_source["ses_leaf"]["project"], "/repo/root")
+        self.assertEqual(by_source["ses_mid"]["project"], "/repo/root")
+        self.assertEqual(by_source["ses_leaf"]["agent_depth"], 2)
+        self.assertEqual(by_source["ses_mid"]["agent_depth"], 1)
+        self.assertEqual(by_source["ses_leaf"]["agent_root_id"], "ses_root")
+        self.assertTrue(by_source["ses_mid"]["agent_has_children"])
+        self.assertEqual(leaf_record["depth"], 2)
+        sessions = {row["id"]: row for row in cross["sessions"]}
+        self.assertEqual(sessions["ses_leaf"]["root_session_id"], "ses_root")
+        self.assertEqual(sessions["ses_leaf"]["child_depth"], 2)
+        self.assertAlmostEqual(cross["total_cost"], 0.875)
+        self.assertEqual(cross["agent_usage"]["totals"]["unresolved_agents"], 0)
+        self.assertEqual(cross["agent_usage"]["totals"]["agents"], 2)
+
+    def test_parent_cost_excludes_children_so_headline_is_parent_plus_children(self):
+        """Pin the additive assumption against message-level parent evidence."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = 1_784_548_900_000
+            rows = (
+                self._session_row("ses_top", "/repo", "Root", "model-a",
+                                  1.25, 10, 5, 0, 0, 0, base),
+                self._session_row("ses_a", "/repo", "A", "model-a",
+                                  3.00, 10, 5, 0, 0, 0, base + 1000,
+                                  parent_id="ses_top", agent="explore"),
+            )
+            db_path = self._family_db(root, base, rows)
+            _sources, cross, family = self._cross(db_path)
+
+        costs = {row["id"]: row["cost"] for row in cross["sessions"]}
+        self.assertAlmostEqual(costs["ses_top"], 1.25)
+        self.assertAlmostEqual(cross["total_cost"], 4.25)
+        self.assertFalse(any(row.get("_cost_includes_children") for row in family))
+
+    def test_inclusive_parent_cost_is_not_double_counted(self):
+        """A parent cost that already includes its children keeps only its own share."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = 1_784_548_900_000
+            parent = self._session_row("ses_top", "/repo", "Root", "model-a",
+                                       4.25, 10, 5, 0, 0, 0, base)
+            child = self._session_row("ses_a", "/repo", "A", "model-a",
+                                      3.00, 10, 5, 0, 0, 0, base + 1000,
+                                      parent_id="ses_top", agent="explore")
+            conn = self._build_db(root)
             self._insert_sessions(conn, (parent, child))
+            # The parent's own messages cost 1.25; its session cost is 1.25 + 3.00.
+            self._assistant(conn, "m-top", "ses_top", 1.25, base)
+            self._assistant(conn, "m-a", "ses_a", 3.00, base + 1)
             conn.commit()
             conn.close()
-            with mock.patch.object(meter, "OPENCODE_DB", str(root / "opencode.db")):
-                sources = {row["id"]: row for row in meter.opencode_session_sources()}
-                meter._summary_cache.clear()
-                rows = [meter.session_summary(sources[sid]) for sid in ("ses_top", "ses_child")]
-                public = agent_usage_projection(
-                    meter._domain_aggregate_agent_usage(
-                        meter._domain_build_agent_groups(rows)
-                    )
-                )
+            _sources, cross, _family = self._cross(root / "opencode.db")
 
-        serialized = json.dumps(public, default=str)
-        # The allowlisted projection never carries the raw parent linkage key.
-        self.assertNotIn("child_parent_id", serialized)
-        # root_session_id is the established public session route, so the parent
-        # id itself stays navigable — the unlisted linkage key is what matters.
-        self.assertNotIn("child_parent", serialized)
+        costs = {row["id"]: row["cost"] for row in cross["sessions"]}
+        self.assertAlmostEqual(costs["ses_top"], 1.25)
+        self.assertAlmostEqual(cross["total_cost"], 4.25)
+
+    def test_live_child_runs_fold_into_one_current_root_session(self):
+        """Root + active child + grandchild form one current session and one cap."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now_ms = int(time.time() * 1000)
+            # The root itself is idle; only its descendants are active.
+            rows = (
+                self._session_row("ses_root", "/repo", "Root", "model-a",
+                                  1.00, 10, 5, 0, 0, 0, now_ms - 40 * 60_000),
+                self._session_row("ses_child", "/repo", "Child", "model-a",
+                                  2.00, 20, 10, 0, 0, 0, now_ms - 30_000,
+                                  parent_id="ses_root", agent="explore"),
+                self._session_row("ses_grand", "/repo", "Grand", "model-a",
+                                  4.00, 40, 20, 0, 0, 0, now_ms - 20_000,
+                                  parent_id="ses_child", agent="explore"),
+            )
+            db_path = self._family_db(root, now_ms - 50 * 60_000, rows)
+            sources, cross, family = self._cross(db_path)
+
+        current = cross["current_sessions"]
+        self.assertEqual([row["id"] for row in current], ["ses_root"])
+        self.assertAlmostEqual(current[0]["cost"], 7.00)
+        self.assertEqual(current[0]["turns"], 3)
+        self.assertEqual(current[0]["subagent_runs"], 2)
+        self.assertEqual(current[0]["activity_state"], "working")
+
+        # The native recent-session list offers the root, never a child run.
+        recent = meter.menubar_recent_sessions(sources, summaries=current)
+        self.assertEqual([row["id"] for row in recent], ["ses_root"])
+        # The watcher's live source is the root even though a child is newest.
+        self.assertEqual(meter.newest_current_source(sources)["id"], "ses_root")
+
+        # A child run has no separate cap: it reports the root's cap, and the
+        # root cap's spend includes every child run.
+        settings = meter.normalize_budget_settings({})
+        with mock.patch.dict(meter._xsess, {"sessions": family}):
+            root_snapshot = meter.session_budget_snapshot(
+                {"id": "ses_root"}, {"total_cost": 1.0, "availability": {"cost": True}},
+                settings,
+            )
+            child_snapshot = meter.session_budget_snapshot(
+                {"id": "ses_grand"}, {"total_cost": 4.0, "availability": {"cost": True}},
+                settings,
+            )
+        self.assertEqual(root_snapshot["id"], "ses_root")
+        self.assertAlmostEqual(root_snapshot["spend_usd"], 7.0)
+        self.assertEqual(root_snapshot["subagent_runs"], 2)
+        self.assertEqual(child_snapshot["id"], "ses_root")
+        self.assertAlmostEqual(child_snapshot["spend_usd"], 7.0)
 
     def test_discovery_reuses_idle_database_inventory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -16464,29 +16684,77 @@ class OpenCodeSubagentDashboardContractTests(unittest.TestCase):
         )
 
     def test_child_sessions_are_filtered_from_the_default_list(self):
-        self.assertIn("if(!globalShowChildren&&s.is_child_session)return false;", self.page)
+        self.assertIn("const view=allSessionsView(all,{showChildren:globalShowChildren", self.page)
+        self.assertIn("rows=(all||[]).filter(s=>!s.is_child_session&&", self.page)
         self.assertIn("let globalShowChildren=localStorage.getItem('tm_global_children')", self.page)
         self.assertIn("data-gchildren=hide", self.page)
         self.assertIn("data-gchildren=show", self.page)
         # The preference is a stored browser preference and is restored on load.
         self.assertIn("paintGlobalChildren();", self.page)
-        # The control is a real radio group, so the selected option is exposed
-        # to assistive technology rather than conveyed by styling alone.
-        self.assertIn("role=radiogroup aria-label=\"Subagent run visibility\"", self.page)
-        self.assertIn("role=radio aria-checked=true data-gchildren=hide", self.page)
-        self.assertIn("role=radio aria-checked=false data-gchildren=show", self.page)
-        self.assertIn("b.setAttribute('aria-checked',on?'true':'false');", self.page)
+        # The control matches the g-sort segmented buttons: plain tab-reachable
+        # buttons with pressed state, not an ARIA radio group without arrow keys.
+        control = re.search(r'id=g-children[^>]*>(.*?)</div>', self.page, re.S).group(0)
+        self.assertNotIn("role=radio", control)
+        self.assertIn("type=button aria-pressed=true data-gchildren=hide", control)
+        self.assertIn("type=button aria-pressed=false data-gchildren=show", control)
+        self.assertNotIn("role=radiogroup", self.page)
+        self.assertIn("b.setAttribute('aria-pressed',on?'true':'false');", self.page)
 
     def test_hidden_child_spend_is_still_reported_in_the_row_count_line(self):
         # Filtering rows out of a list must not imply their spend was excluded.
-        self.assertIn("const hiddenChildren=all.filter(s=>s.is_child_session).length;", self.page)
-        self.assertIn("metricAvailable(s,'cost')).reduce((a,b)=>a+(b.cost||0),0);", self.page)
+        self.assertIn("renderAllSessionStats(view.statsRows);", self.page)
+        self.assertIn("setLogText($('g-count'),allSessionsCountText(view));", self.page)
         self.assertIn("counted, ${parentNote}", self.page)
         self.assertIn("listed under parents", self.page)
-        # Hidden runs with no parent row must not be claimed to sit under a
-        # parent, because their parent session was never discovered.
-        self.assertIn("const unparentedChildren=all.filter(s=>s.is_child_session&&!(", self.page)
         self.assertIn("with no parent session", self.page)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard JavaScript")
+    def test_all_sessions_view_counts_children_and_respects_filters(self):
+        page_path = Path(__file__).resolve().parents[1].joinpath("page.html")
+        script = f"""
+const fs=require('fs');
+const page=fs.readFileSync({json.dumps(str(page_path))},'utf8');
+function extract(name){{let start=page.indexOf(`function ${{name}}(`);if(start<0)throw Error(`missing ${{name}}`);let i=page.indexOf('{{',start),depth=0;for(;i<page.length;i++){{if(page[i]==='{{')depth++;else if(page[i]==='}}'&&--depth===0)return page.slice(start,i+1);}}throw Error(`unclosed ${{name}}`);}}
+const appFilterGroup=s=>s.provider,projectFilterValue=p=>p||'',metricAvailable=(row,key)=>row?.availability?.[key]!==false,hasLocalEstimate=()=>false;
+const f=n=>String(n),money=n=>'$'+Number(n).toFixed(2),countWord=(n,w)=>n===1?w:w+'s';
+eval(extract('childRootId'));eval(page.slice(page.indexOf('function allSessionsView('),page.indexOf('function allSessionsCountText(')));eval(extract('allSessionsCountText'));
+const all=[
+ {{id:'root',provider:'opencode',project:'/a',title:'Root work',cost:1,mtime:100}},
+ {{id:'mid',provider:'opencode',project:'/a',title:'Mid run',cost:2,mtime:200,is_child_session:true,root_session_id:'root',child_depth:1}},
+ {{id:'leaf',provider:'opencode',project:'/a',title:'Needle leaf',cost:4,mtime:300,is_child_session:true,root_session_id:'root',child_depth:2}},
+ {{id:'orphan',provider:'opencode',project:'/a',title:'Orphan',cost:8,mtime:300,is_child_session:true}},
+ {{id:'other',provider:'claude',project:'/b',title:'Other',cost:16,mtime:400}},
+];
+const hidden=allSessionsView(all,{{}});
+const listed=allSessionsView(all,{{showChildren:true}});
+const project=allSessionsView(all,{{project:'/b'}});
+const search=allSessionsView(all,{{query:'needle'}});
+console.log(JSON.stringify({{
+ hiddenRows:hidden.rows.map(r=>r.id),hiddenStatsCost:hidden.statsRows.reduce((a,b)=>a+b.cost,0),
+ listedStatsCost:listed.statsRows.reduce((a,b)=>a+b.cost,0),listedRows:listed.rows.length,
+ hidden:{{children:hidden.children,underParent:hidden.underParent,unparented:hidden.unparented,total:hidden.total}},
+ hiddenText:allSessionsCountText(hidden),
+ project:{{rows:project.rows.map(r=>r.id),children:project.children,text:allSessionsCountText(project)}},
+ search:{{rows:search.rows.map(r=>r.id),children:search.children,underParent:search.underParent}},
+}}));
+"""
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["hiddenRows"], ["root", "other"])
+        # Header stats include hidden child spend, identical to Listed mode.
+        self.assertEqual(data["hiddenStatsCost"], 31)
+        self.assertEqual(data["listedStatsCost"], 31)
+        self.assertEqual(data["listedRows"], 5)
+        # The grandchild counts under its root card even though its parent is hidden.
+        self.assertEqual(data["hidden"], {"children": 3, "underParent": 2, "unparented": 1, "total": 2})
+        self.assertIn("2 of 2 sessions · $31.00 covered spend", data["hiddenText"])
+        self.assertIn("3 subagent runs ($14.00) counted, 2 shown under parent cards · 1 with no parent session", data["hiddenText"])
+        # The hidden-children note respects the active project filter.
+        self.assertEqual(data["project"]["rows"], ["other"])
+        self.assertEqual(data["project"]["children"], 0)
+        self.assertNotIn("subagent", data["project"]["text"])
+        # Search in Hidden mode finds a child run by surfacing its root card.
+        self.assertEqual(data["search"], {"rows": ["root"], "children": 1, "underParent": 1})
 
     def test_parent_card_renders_an_accessible_child_subsection(self):
         self.assertIn("function childAgentSubsection(s)", self.page)
@@ -16518,6 +16786,9 @@ class OpenCodeSubagentDashboardContractTests(unittest.TestCase):
     def test_child_changes_invalidate_the_cached_parent_row(self):
         self.assertIn("childAgentsFor(s).map(c=>[c.id,c.cost,c.tokens", self.page)
         self.assertIn("function indexChildSessions(rows)", self.page)
+        # Every descendant is keyed by its published root id, never a raw parent id.
+        self.assertIn("const key=childRootId(row);", self.page)
+        self.assertNotIn("child_parent_id", self.page)
 
     def test_subagents_page_discloses_unattributed_child_runs(self):
         # A child run whose parent was never discovered is counted in totals but
@@ -16528,6 +16799,10 @@ class OpenCodeSubagentDashboardContractTests(unittest.TestCase):
         self.assertIn("usage?.totals?.unresolved_known_cost", self.page)
         self.assertIn("could not be attributed to a parent session", self.page)
         self.assertIn("counted in global totals", self.page)
+        # Archived families are excluded from discovery, so the only remaining
+        # cause is a missing parent record; the copy must not blame archiving.
+        self.assertNotIn("usually because the parent session was archived", self.page)
+        self.assertIn("parent session record is missing", self.page)
         self.assertIn(".subagentCoverageNote[hidden]{display:none}", self.page)
 
     def test_parent_row_with_children_uses_top_aligned_metrics(self):
