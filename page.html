@@ -6903,13 +6903,17 @@ function allSessionsView(all,{showChildren=false,app='',project='',rangeStart=0,
   const childRoots=new Set(children.map(childRootId).filter(Boolean));
   rows=(all||[]).filter(s=>!s.is_child_session&&((baseMatch(s)&&textMatch(s))||childRoots.has(String(s.id))));
  }
- const statsIds=new Set(),statsRows=[];
- [...matching,...rows].forEach(s=>{const id=String(s.id);if(!statsIds.has(id)){statsIds.add(id);statsRows.push(s);}});
+ // Header figures cover exactly the matching sessions and child runs in both
+ // modes; a root card surfaced only by a matching child adds no spend of its own.
+ const statsRows=matching;
  const shownIds=new Set(rows.map(s=>String(s.id)));
  const underParent=children.filter(s=>shownIds.has(childRootId(s))).length;
+ const matchedSessions=matching.length-children.length;
  return {
   rows,statsRows,showChildren,
-  total:(all||[]).filter(s=>showChildren||!s.is_child_session).length,
+  matchedSessions,
+  total:(all||[]).filter(s=>!s.is_child_session).length,
+  surfacedParents:showChildren?0:Math.max(0,rows.length-matchedSessions),
   children:children.length,
   childCost:children.filter(s=>metricAvailable(s,'cost')).reduce((a,b)=>a+(b.cost||0),0),
   underParent,
@@ -6917,7 +6921,7 @@ function allSessionsView(all,{showChildren=false,app='',project='',rangeStart=0,
  };
 }
 function allSessionsCountText(view){
- const statsRows=view.statsRows,rows=view.rows;
+ const statsRows=view.statsRows;
  const cost=statsRows.reduce((a,b)=>a+(b.cost||0),0),localEstimates=statsRows.filter(row=>hasLocalEstimate(row)&&metricAvailable(row,'cost')).length,costCovered=statsRows.filter(row=>metricAvailable(row,'cost')).length;
  // Hidden subagent runs are still counted in totals, so report how many of the
  // matching runs sit under a shown parent card and how many have no parent.
@@ -6927,7 +6931,11 @@ function allSessionsCountText(view){
  const childNote=!view.showChildren&&view.children
   ?` · includes ${f(view.children)} subagent ${countWord(view.children,'run')} (${money(view.childCost)}) counted, ${parentNote}`
   :'';
- return `${f(rows.length)} of ${f(view.total)} sessions · ${money(cost)} covered spend · ${f(costCovered)} of ${f(statsRows.length)} cost-covered${localEstimates?` · includes ${f(localEstimates)} Cursor local ${countWord(localEstimates,'estimate')}`:''}${childNote}`;
+ // Sessions and child runs are counted separately; spend and cost coverage
+ // share one denominator: the matching sessions plus matching child runs.
+ const runNote=view.showChildren&&view.children?` + ${f(view.children)} subagent ${countWord(view.children,'run')}`:'';
+ const surfacedNote=view.surfacedParents?` · ${f(view.surfacedParents)} parent ${countWord(view.surfacedParents,'card')} shown for matching runs`:'';
+ return `${f(view.matchedSessions)} of ${f(view.total)} sessions${runNote} · ${money(cost)} covered spend · ${f(costCovered)} of ${f(statsRows.length)} cost-covered${localEstimates?` · includes ${f(localEstimates)} Cursor local ${countWord(localEstimates,'estimate')}`:''}${childNote}${surfacedNote}`;
 }
 function renderAllSessions(xs){
  if(!xs)return;
@@ -7503,7 +7511,9 @@ function renderCurrentSessions(state=LATEST){
   const {state:activity,label:activityLabel}=currentSessionActivity(row);
   const costAvailable=row.availability?.cost!==false;
   const estimate=row.cost_approx||['local_estimate','mixed'].includes(row.usage_basis);
-  const cost=costValueHtml(money(row.cost)+(estimate?' est':''),costAvailable,false);
+  // A folded family with an unmeasured member reports a lower bound.
+  const costPartial=costAvailable&&!!row.cost_partial;
+  const cost=costValueHtml((costPartial?'≥':'')+money(row.cost)+(estimate?' est':''),costAvailable,false);
   const costTipAttrs=costAvailable?'':costUnavailableAttrs();
   const outputPerDollar=row.output_per_dollar==null?'--':compactNumber(row.output_per_dollar);
   const context=currentSessionContext(row);
@@ -7515,7 +7525,7 @@ function renderCurrentSessions(state=LATEST){
   const speed=speedAvailable?`${speedFmt(throughput.output_tps)} tok/s${row.token_estimate?' est':''}`:'--';
   const contextSpark=currentSessionContextSparkline(row);
   const outputDollarDescription=row.output_per_dollar==null?'Output per dollar unavailable.':`${compactNumber(row.output_per_dollar)} output tokens per covered dollar.`;
-  const cardDescription=`${contextSpark.summary} ${outputDollarDescription} Drag to reorder. Press ⌥ and an arrow key to move.`;
+  const cardDescription=`${contextSpark.summary} ${outputDollarDescription}${costPartial?' Cost is a lower bound: some subagent runs have no cost evidence.':''} Drag to reorder. Press ⌥ and an arrow key to move.`;
   const arriving=arrivingIds.has(String(row.id))?' is-arriving':'';
   return `<button class="card currentSessionCard provider-${esc(provider)} activity-${activity}${arriving}${costAvailable?'':' fieldtip'}" style="--harness:${esc(runtimeHarness(row))}" type=button draggable=true data-current-session-id="${esc(row.id)}" aria-label="${esc(`Open ${sessionName}`)}" aria-description="${esc(cardDescription)}" aria-keyshortcuts="Alt+ArrowLeft Alt+ArrowRight Alt+ArrowUp Alt+ArrowDown" ${costTipAttrs}><div class=currentSessionTop><div class=currentSessionRuntime>${runtimeMarkSvg(row)}<span>${esc(runtimeLine)}</span></div><div class="currentSessionStatus ${activity}">${activityLabel}</div></div><div class=currentSessionIdentity><h3>${esc(sessionName)}</h3><p>${esc(row.project||'No project')}</p></div><div class=currentSessionMetrics><div class=currentSessionMetric><span>Cost</span><b class=mono>${cost}</b></div><div class=currentSessionMetric><span>Output / $</span><b class=mono>${esc(outputPerDollar)}</b></div><div class=currentSessionMetric><span>Context in use</span><div class=currentSessionContextValue><b class=mono>${esc(context)}</b>${contextSpark.html}</div></div><div class=currentSessionMetric><span>Speed</span><b class=mono>${esc(speed)}</b></div></div><div class=currentSessionFoot><span class=currentSessionMove><svg class=currentSessionGrip viewBox="0 0 12 16" aria-hidden=true><circle cx="3" cy="3" r="1.2"/><circle cx="9" cy="3" r="1.2"/><circle cx="3" cy="8" r="1.2"/><circle cx="9" cy="8" r="1.2"/><circle cx="3" cy="13" r="1.2"/><circle cx="9" cy="13" r="1.2"/></svg>${currentSessionAge(row)}</span></div></button>`;
  }).join(''):(filterView.activitySelection==='all'?currentSessionsEmptyHtml(state?.xsession):currentSessionsFilteredEmptyHtml(filterView.activitySelection));

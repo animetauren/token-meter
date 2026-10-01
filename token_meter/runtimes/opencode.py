@@ -43,7 +43,6 @@ SUMMARY_MESSAGE_LIMIT = 500
 MAX_SESSION_ANCESTRY = 32
 # Relative tolerance used when deciding whether a parent's reported cost already
 # includes its children's cost.
-INCLUSIVE_COST_TOLERANCE = 0.005
 
 
 def _compact_text(value, limit=90):
@@ -925,8 +924,6 @@ class OpenCodeRuntimeAdapter:
             "cache_read": int(s_cr or 0), "output": int(s_output or 0),
         }
         s_cost_val = float(s_cost or 0.0)
-        if source.get("agent_has_children"):
-            s_cost_val, _inclusive = self._exclusive_cost(sid, s_cost)
         total_cost = s_cost_val
         total_tokens = sum(tot.values()) + int(s_reasoning or 0)
         full_cost_breakdown = distribute_cost(total_cost, {
@@ -1048,11 +1045,6 @@ class OpenCodeRuntimeAdapter:
             )
         s_input, s_output, s_reasoning, s_cr, s_cw, s_cost, s_model_raw, created, updated = row
         s_cost_val = float(s_cost or 0.0)
-        cost_includes_children = False
-        if source.get("agent_has_children"):
-            s_cost_val, cost_includes_children = self._exclusive_cost(
-                sid, s_cost, connection=connection,
-            )
         inp = int(s_input or 0)
         out = int(s_output or 0)
         reasoning = int(s_reasoning or 0)
@@ -1334,8 +1326,6 @@ class OpenCodeRuntimeAdapter:
             row["child_agent_role"] = safe_agent_role(
                 source.get("agent_role")
             ) or None
-        if cost_includes_children:
-            row["_cost_includes_children"] = True
         signal_rollups, signal_events = analyze_language_signal_turns(signal_turns)
         attach_language_signals(row, signal_rollups, signal_events)
         agent_records = self._agent_record_for(
@@ -1349,59 +1339,6 @@ class OpenCodeRuntimeAdapter:
         if agent_records:
             row["_agent_records"] = agent_records
         return row
-
-    def _exclusive_cost(self, session_id, reported_cost_value, connection=None):
-        """Return a parent's own cost and whether it already included children.
-
-        OpenCode reports a parent's session cost exclusive of its child sessions,
-        and totals rely on that: the headline is parent plus children. If a
-        future OpenCode build reported an inclusive parent cost, adding children
-        would double count. A parent is treated as inclusive only when its
-        reported cost reaches its own message-level cost plus its direct
-        children's cost (within a small tolerance) while children carry cost;
-        its own share is then the reported cost minus those children. Without
-        message-level cost evidence the reported cost is kept unchanged.
-        """
-        if (
-            isinstance(reported_cost_value, bool)
-            or not isinstance(reported_cost_value, (int, float))
-            or not math.isfinite(float(reported_cost_value))
-        ):
-            return float(reported_cost_value or 0.0), False
-        reported = float(reported_cost_value)
-        conn = connection if isinstance(connection, sqlite3.Connection) else None
-        owns_connection = conn is None
-        try:
-            if conn is None:
-                conn = self.connection()
-            child_row = conn.execute(
-                "SELECT COUNT(*), COALESCE(SUM(cost),0) FROM session "
-                "WHERE parent_id=? AND time_archived IS NULL "
-                "AND typeof(cost) IN ('real','integer')",
-                (session_id,),
-            ).fetchone()
-            own_row = conn.execute(
-                "SELECT COUNT(*), COALESCE(SUM(json_extract(data,'$.cost')),0) "
-                "FROM message WHERE session_id=? "
-                "AND json_extract(data,'$.role')='assistant' "
-                "AND json_type(data,'$.cost') IN ('real','integer')",
-                (session_id,),
-            ).fetchone()
-        except (OSError, sqlite3.Error):
-            return reported, False
-        finally:
-            if owns_connection and conn is not None:
-                conn.close()
-        child_count, child_cost = int(child_row[0] or 0), float(child_row[1] or 0.0)
-        own_count, own_cost = int(own_row[0] or 0), float(own_row[1] or 0.0)
-        if not child_count or child_cost <= 1e-9 or not own_count:
-            return reported, False
-        # Scale the tolerance by the children's cost so a small child under a
-        # large parent never makes an exclusive parent look inclusive.
-        tolerance = max(1e-6, INCLUSIVE_COST_TOLERANCE * child_cost)
-        if reported + tolerance >= own_cost + child_cost:
-            return max(0.0, reported - child_cost), True
-        return reported, False
 
     def _agent_record_for(
         self, source, row, *, cost_value, cost_available, tokens_available,

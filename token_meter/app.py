@@ -8265,18 +8265,24 @@ def session_budget_snapshot(source, state, settings=None):
         own_id, root_id=folded_child_root_id(source) or None,
     )
     budget_usd, source_kind = effective_session_budget(session_id, settings)
-    cost_available = metric_available(state, "cost")
-    spend = float(state.get("total_cost") or 0) if cost_available else None
-    if spend is not None and children:
+    own_cost_available = metric_available(state, "cost")
+    spend = float(state.get("total_cost") or 0) if own_cost_available else None
+    cost_partial = False
+    if children:
         # One cap covers the root and every child run: add the cached spend of
-        # each other family member to this session's live spend.
+        # each other family member to this session's live spend. Measured
+        # members count even when this session's own cost is unavailable, and
+        # any unavailable member makes the spend a lower bound.
         others = [row for row in children if str(row.get("id") or "") != own_id]
         if own_id != session_id and root_row is not None:
             others.append(root_row)
-        spend += sum(
-            float(row.get("cost") or 0) for row in others
-            if metric_available(row, "cost")
+        measured = [row for row in others if metric_available(row, "cost")]
+        if measured:
+            spend = (spend or 0.0) + sum(float(row.get("cost") or 0) for row in measured)
+        cost_partial = spend is not None and (
+            not own_cost_available or len(measured) < len(others)
         )
+    cost_available = spend is not None
     spend_usd = round(spend, 4) if spend is not None else None
     percent_used = round((100 * spend_usd / budget_usd), 2) if spend_usd is not None else None
     remaining_usd = round(budget_usd - spend_usd, 4) if spend_usd is not None else None
@@ -8298,7 +8304,7 @@ def session_budget_snapshot(source, state, settings=None):
         ),
         "reached_thresholds": reached,
         "cost_available": cost_available,
-        **({"subagent_runs": len(children)} if children else {}),
+        **({"cost_partial": cost_partial} if children else {}),
     }
 
 

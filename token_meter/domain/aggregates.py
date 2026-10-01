@@ -288,10 +288,22 @@ def fold_child_session_rows(rows):
             result.append(row)
             continue
         merged = dict(row)
-        for field in ("cost", "tokens", "input_tokens", "output_tokens"):
-            merged[field] = (row.get(field) or 0) + sum(
-                member.get(field) or 0 for member in members
-            )
+        family = [row, *members]
+        availability = dict(row.get("availability") or {}) if isinstance(
+            row.get("availability"), dict) else {}
+        # Sum only members whose metric is measured: the folded figure is
+        # available when any member's is, and partial when any member's is not,
+        # so unavailable evidence never becomes a measured zero or looks complete.
+        for field, metric in (
+            ("cost", "cost"), ("tokens", "tokens"),
+            ("input_tokens", "input_tokens"), ("output_tokens", "output_tokens"),
+        ):
+            covered = [member for member in family if metric_available(member, metric)]
+            merged[field] = sum(member.get(field) or 0 for member in covered)
+            availability[metric] = bool(covered)
+            if metric == "cost":
+                merged["cost_partial"] = bool(covered) and len(covered) < len(family)
+        merged["availability"] = availability
         merged["turns"] = int(row.get("turns") or 0) + sum(
             int(member.get("turns") or 0) for member in members
         )
@@ -314,7 +326,6 @@ def fold_child_session_rows(rows):
             *(row.get("model_stats") or []),
             *(stats for member in members for stats in (member.get("model_stats") or [])),
         ]
-        merged["subagent_runs"] = len(members)
         result.append(merged)
     return result
 
@@ -408,6 +419,7 @@ def current_session_summaries(rows, now=None, max_age_s=30 * 60, limit=8,
             "cost": float(row.get("cost") or 0),
             "output_per_dollar": output_per_dollar,
             "cost_approx": bool(row.get("cost_approx")),
+            "cost_partial": bool(row.get("cost_partial")),
             "availability": {
                 "cost": availability.get("cost") is not False,
                 "context": availability.get("context") is not False,
@@ -440,7 +452,6 @@ def current_session_summaries(rows, now=None, max_age_s=30 * 60, limit=8,
             },
             "token_estimate": bool(row.get("token_estimate")),
             "turns": int(row.get("turns") or 0),
-            "subagent_runs": int(row.get("subagent_runs") or 0),
             "mtime": candidate["mtime"],
             "idle_s": candidate["idle_s"],
             "activity_state": candidate["activity_state"],

@@ -178,35 +178,42 @@ non-empty `directory`, so the fallback does not trigger.
 - One adapter failure cannot suppress Claude, Codex, or Kiro agent statistics.
 - Public errors and warnings contain no session id, path, or provider content.
 
-## Additive Cost Guard
+## Additive Cost Assumption
 
-Headline totals assume `session.cost` of a parent excludes its children, so the
-family headline is parent plus children. A test pins this against message-level
-evidence. As a defensive check, a parent with children is treated as inclusive
-when its reported cost reaches its own assistant-message cost plus its direct
-non-archived children's cost (within 0.5% of the children's cost); its own
-share then becomes the reported cost minus those children, so a future
-inclusive OpenCode build cannot double count. Without message-level cost
-evidence for the parent the reported cost is kept unchanged. The adjustment
-applies to summary and detail paths and is marked privately on the summary row; the native
-`SessionSource` load path keeps the reported cost because it carries no family
-evidence.
+Session totals assume a parent's `session.cost` excludes its children, so a
+family's spend is the parent's reported cost plus each child's reported cost.
+Token Meter never subtracts child cost from a parent: a parent may legitimately
+report more than its remaining message-level cost (for example after reverted
+messages), so that gap is not evidence of included child spend, and no OpenCode
+build is known to report inclusive parent costs. Tests pin both the additive
+total and a parent whose reported cost exceeds its own messages staying
+unchanged. If OpenCode ever reports inclusive parent costs, this assumption must
+be revisited with source evidence.
 
 ## Current Sessions And Session Caps
 
 A child run is part of its root session's live work, not a separate current
 session. `current_session_summaries` folds each child with a resolved root into
-the root's row: cost, tokens, and executions are summed, `subagent_runs` counts
-the folded runs, and the newest child activity becomes the row's activity, so a
+the root's row: cost, tokens, and executions are summed, and the newest child
+activity becomes the row's activity, so a
 root whose own messages are idle still appears current while a descendant
 works. A child whose root row is absent (unresolved family, or a root with no
 executions) stays its own row so its spend is never hidden. The same rule
 applies to the watcher's live source, menu-bar recent sessions, implicit MCP
-run selection, and the `/session` live flag.
+run selection, and the `/session` live flag. MCP `sessions` reports a root as
+`current` while any of its child runs is current; each child keeps its own
+state.
+
+Folded cost and tokens sum only members whose metric is measured. The folded
+metric is available when any member's is, and `cost_partial` marks a folded
+cost that omits an unavailable member, so the card shows it as a lower bound
+rather than a complete figure or a measured zero.
 
 A child run has no separate cap. `session_budget_snapshot` reports the root's
 cap for every family member, and its spend is the live session's spend plus the
-cached spend of every other family member. Setting a cap from a child, through
+cached spend of every other measured family member. Measured members count even
+when the live session's own cost is unavailable, and `cost_partial` marks spend
+that omits an unavailable member. Setting a cap from a child, through
 HTTP or MCP, writes the root's override.
 
 ## Compatibility

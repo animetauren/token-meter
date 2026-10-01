@@ -6837,7 +6837,7 @@ console.log(JSON.stringify({available,unavailable:{text:element.textContent,clas
         session_cards = self.page.split("function renderCurrentSessions(state=LATEST){", 1)[1].split(
             "const currentSessionGrid=$('current-session-grid');", 1
         )[0]
-        self.assertIn("costValueHtml(money(row.cost)+(estimate?' est':''),costAvailable,false)", session_cards)
+        self.assertIn("costValueHtml((costPartial?'≥':'')+money(row.cost)+(estimate?' est':''),costAvailable,false)", session_cards)
         self.assertIn("const costTipAttrs=costAvailable?'':costUnavailableAttrs();", session_cards)
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard JavaScript")
@@ -16135,30 +16135,34 @@ class OpenCodeTests(unittest.TestCase):
         costs = {row["id"]: row["cost"] for row in cross["sessions"]}
         self.assertAlmostEqual(costs["ses_top"], 1.25)
         self.assertAlmostEqual(cross["total_cost"], 4.25)
-        self.assertFalse(any(row.get("_cost_includes_children") for row in family))
+        self.assertFalse(any("_cost_includes_children" in row for row in family))
 
-    def test_inclusive_parent_cost_is_not_double_counted(self):
-        """A parent cost that already includes its children keeps only its own share."""
+    def test_parent_cost_above_own_messages_is_kept_and_children_added(self):
+        """A parent reporting more than its own message sum is never reduced.
+
+        Reverted messages leave a parent's session cost above its remaining
+        message-level cost; that gap must not be read as included child spend.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             base = 1_784_548_900_000
             parent = self._session_row("ses_top", "/repo", "Root", "model-a",
-                                       4.25, 10, 5, 0, 0, 0, base)
+                                       3.00, 10, 5, 0, 0, 0, base)
             child = self._session_row("ses_a", "/repo", "A", "model-a",
-                                      3.00, 10, 5, 0, 0, 0, base + 1000,
+                                      0.50, 10, 5, 0, 0, 0, base + 1000,
                                       parent_id="ses_top", agent="explore")
             conn = self._build_db(root)
             self._insert_sessions(conn, (parent, child))
-            # The parent's own messages cost 1.25; its session cost is 1.25 + 3.00.
-            self._assistant(conn, "m-top", "ses_top", 1.25, base)
-            self._assistant(conn, "m-a", "ses_a", 3.00, base + 1)
+            self._assistant(conn, "m-top", "ses_top", 1.00, base)
+            self._assistant(conn, "m-a", "ses_a", 0.50, base + 1)
             conn.commit()
             conn.close()
-            _sources, cross, _family = self._cross(root / "opencode.db")
+            _sources, cross, family = self._cross(root / "opencode.db")
 
         costs = {row["id"]: row["cost"] for row in cross["sessions"]}
-        self.assertAlmostEqual(costs["ses_top"], 1.25)
-        self.assertAlmostEqual(cross["total_cost"], 4.25)
+        self.assertAlmostEqual(costs["ses_top"], 3.00)
+        self.assertAlmostEqual(costs["ses_a"], 0.50)
+        self.assertAlmostEqual(sum(row["cost"] for row in family), 3.50)
 
     def test_live_child_runs_fold_into_one_current_root_session(self):
         """Root + active child + grandchild form one current session and one cap."""
@@ -16183,7 +16187,8 @@ class OpenCodeTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in current], ["ses_root"])
         self.assertAlmostEqual(current[0]["cost"], 7.00)
         self.assertEqual(current[0]["turns"], 3)
-        self.assertEqual(current[0]["subagent_runs"], 2)
+        self.assertNotIn("subagent_runs", current[0])
+        self.assertFalse(current[0]["cost_partial"])
         self.assertEqual(current[0]["activity_state"], "working")
 
         # The native recent-session list offers the root, never a child run.
@@ -16206,9 +16211,60 @@ class OpenCodeTests(unittest.TestCase):
             )
         self.assertEqual(root_snapshot["id"], "ses_root")
         self.assertAlmostEqual(root_snapshot["spend_usd"], 7.0)
-        self.assertEqual(root_snapshot["subagent_runs"], 2)
+        self.assertNotIn("subagent_runs", root_snapshot)
+        self.assertFalse(root_snapshot["cost_partial"])
         self.assertEqual(child_snapshot["id"], "ses_root")
         self.assertAlmostEqual(child_snapshot["spend_usd"], 7.0)
+
+    def test_session_cap_spend_combines_family_cost_availability(self):
+        """Measured family spend is kept and any unavailable member is partial."""
+        def family(root_available, child_available):
+            return [
+                {"id": "ses_root", "provider": "opencode", "cost": 1.0,
+                 "availability": {"cost": root_available}},
+                {"id": "ses_child", "provider": "opencode", "cost": 2.5,
+                 "is_child_session": True, "root_session_id": "ses_root",
+                 "availability": {"cost": child_available}},
+            ]
+
+        settings = meter.normalize_budget_settings({})
+        with mock.patch.dict(meter._xsess, {"sessions": family(False, True)}):
+            unavailable_root = meter.session_budget_snapshot(
+                {"id": "ses_root"},
+                {"total_cost": 0.0, "availability": {"cost": False}},
+                settings,
+            )
+        self.assertAlmostEqual(unavailable_root["spend_usd"], 2.5)
+        self.assertTrue(unavailable_root["cost_available"])
+        self.assertTrue(unavailable_root["cost_partial"])
+
+        with mock.patch.dict(meter._xsess, {"sessions": family(True, False)}):
+            unavailable_child = meter.session_budget_snapshot(
+                {"id": "ses_root"},
+                {"total_cost": 1.0, "availability": {"cost": True}},
+                settings,
+            )
+        self.assertAlmostEqual(unavailable_child["spend_usd"], 1.0)
+        self.assertTrue(unavailable_child["cost_partial"])
+
+        with mock.patch.dict(meter._xsess, {"sessions": family(False, False)}):
+            unmeasured = meter.session_budget_snapshot(
+                {"id": "ses_root"},
+                {"total_cost": 0.0, "availability": {"cost": False}},
+                settings,
+            )
+        self.assertIsNone(unmeasured["spend_usd"])
+        self.assertFalse(unmeasured["cost_available"])
+        self.assertEqual(unmeasured["threshold_state"], "unavailable")
+
+        # A session with no child runs keeps its existing payload shape.
+        with mock.patch.dict(meter._xsess, {"sessions": []}):
+            solo = meter.session_budget_snapshot(
+                {"id": "ses_solo"},
+                {"total_cost": 1.0, "availability": {"cost": True}},
+                settings,
+            )
+        self.assertNotIn("cost_partial", solo)
 
     def test_discovery_reuses_idle_database_inventory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -16708,6 +16764,11 @@ class OpenCodeSubagentDashboardContractTests(unittest.TestCase):
         self.assertIn("listed under parents", self.page)
         self.assertIn("with no parent session", self.page)
 
+    def test_current_session_card_marks_partial_family_cost_as_lower_bound(self):
+        self.assertIn("const costPartial=costAvailable&&!!row.cost_partial;", self.page)
+        self.assertIn("(costPartial?'≥':'')+money(row.cost)", self.page)
+        self.assertIn("Cost is a lower bound: some subagent runs have no cost evidence.", self.page)
+
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard JavaScript")
     def test_all_sessions_view_counts_children_and_respects_filters(self):
         page_path = Path(__file__).resolve().parents[1].joinpath("page.html")
@@ -16729,7 +16790,16 @@ const hidden=allSessionsView(all,{{}});
 const listed=allSessionsView(all,{{showChildren:true}});
 const project=allSessionsView(all,{{project:'/b'}});
 const search=allSessionsView(all,{{query:'needle'}});
+const spend=v=>v.statsRows.filter(r=>metricAvailable(r,'cost')).reduce((a,b)=>a+(b.cost||0),0);
+const filters={{search:{{query:'needle'}},time:{{rangeStart:250}},project:{{project:'/a'}},searchTime:{{query:'leaf',rangeStart:250}},none:{{}}}};
+const parity=Object.fromEntries(Object.entries(filters).map(([name,opts])=>{{
+ const h=allSessionsView(all,opts),l=allSessionsView(all,{{...opts,showChildren:true}});
+ return [name,{{hidden:spend(h),listed:spend(l),hiddenCovered:h.statsRows.length,listedCovered:l.statsRows.length}}];
+}}));
+const time=allSessionsView(all,{{rangeStart:250}});
 console.log(JSON.stringify({{
+ parity,searchText:allSessionsCountText(search),listedText:allSessionsCountText(listed),
+ time:{{rows:time.rows.map(r=>r.id),text:allSessionsCountText(time)}},
  hiddenRows:hidden.rows.map(r=>r.id),hiddenStatsCost:hidden.statsRows.reduce((a,b)=>a+b.cost,0),
  listedStatsCost:listed.statsRows.reduce((a,b)=>a+b.cost,0),listedRows:listed.rows.length,
  hidden:{{children:hidden.children,underParent:hidden.underParent,unparented:hidden.unparented,total:hidden.total}},
@@ -16747,7 +16817,21 @@ console.log(JSON.stringify({{
         self.assertEqual(data["listedRows"], 5)
         # The grandchild counts under its root card even though its parent is hidden.
         self.assertEqual(data["hidden"], {"children": 3, "underParent": 2, "unparented": 1, "total": 2})
-        self.assertIn("2 of 2 sessions · $31.00 covered spend", data["hiddenText"])
+        self.assertIn("2 of 2 sessions · $31.00 covered spend · 5 of 5 cost-covered", data["hiddenText"])
+        # Hidden and Listed header spend and coverage are equal under every filter,
+        # and a root surfaced only by a matching child adds none of its own cost.
+        for name, row in data["parity"].items():
+            self.assertEqual(row["hidden"], row["listed"], name)
+            self.assertEqual(row["hiddenCovered"], row["listedCovered"], name)
+        self.assertEqual(data["parity"]["search"]["hidden"], 4)
+        self.assertEqual(data["parity"]["time"]["hidden"], 28)
+        self.assertEqual(data["parity"]["searchTime"]["hidden"], 4)
+        self.assertIn("0 of 2 sessions · $4.00 covered spend · 1 of 1 cost-covered", data["searchText"])
+        self.assertIn("1 parent card shown for matching runs", data["searchText"])
+        self.assertIn("2 of 2 sessions + 3 subagent runs · $31.00 covered spend · 5 of 5 cost-covered", data["listedText"])
+        self.assertNotIn("parent card shown", data["listedText"])
+        self.assertEqual(data["time"]["rows"], ["root", "other"])
+        self.assertIn("1 of 2 sessions · $28.00 covered spend · 3 of 3 cost-covered", data["time"]["text"])
         self.assertIn("3 subagent runs ($14.00) counted, 2 shown under parent cards · 1 with no parent session", data["hiddenText"])
         # The hidden-children note respects the active project filter.
         self.assertEqual(data["project"]["rows"], ["other"])
