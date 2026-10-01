@@ -6837,7 +6837,7 @@ console.log(JSON.stringify({available,unavailable:{text:element.textContent,clas
         session_cards = self.page.split("function renderCurrentSessions(state=LATEST){", 1)[1].split(
             "const currentSessionGrid=$('current-session-grid');", 1
         )[0]
-        self.assertIn("costValueHtml((costPartial?'At least ':'')+money(row.cost)+(estimate?' est':''),costAvailable,false)", session_cards)
+        self.assertIn("costValueHtml(money(row.cost)+(estimate?' est':''),costAvailable,false),costLabel=costPartial?'Cost, at least':'Cost'", session_cards)
         self.assertIn("const costTipAttrs=costAvailable?'':costUnavailableAttrs();", session_cards)
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard JavaScript")
@@ -16787,7 +16787,7 @@ class OpenCodeSubagentDashboardContractTests(unittest.TestCase):
 
     def test_current_session_card_marks_partial_family_cost_as_lower_bound(self):
         self.assertIn("const costPartial=costAvailable&&!!row.cost_partial;", self.page)
-        self.assertIn("(costPartial?'At least ':'')+money(row.cost)", self.page)
+        self.assertIn("costLabel=costPartial?'Cost, at least':'Cost'", self.page)
         self.assertNotIn("(costPartial?'≥':'')", self.page)
         self.assertIn(
             "Cost is a lower bound: some runs in this session family have no cost evidence.",
