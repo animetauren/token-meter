@@ -16251,17 +16251,25 @@ class PiSubagentTests(unittest.TestCase):
             _source, _state, summary = self._load(root)
             cross = self._cross(root)
 
-        self.assertTrue(summary["_agent_records_truncated"])
+        self.assertTrue(summary["_agent_records_partial"])
+        self.assertNotIn("_agent_records_truncated", summary)
         usage = cross["agent_usage"]
         self.assertEqual(usage["totals"]["agents"], pi_runtime.MAX_SUBAGENT_RUNS)
         self.assertFalse(usage["totals"]["cost_available"])
         self.assertFalse(usage["totals"]["tokens_available"])
         self.assertIsNone(usage["totals"]["cost"])
-        self.assertTrue(usage["inventory_truncated"])
+        self.assertAlmostEqual(
+            usage["totals"]["known_cost"], 0.01 * pi_runtime.MAX_SUBAGENT_RUNS,
+        )
+        # The run cap is partial coverage, not the inventory display limit.
+        self.assertFalse(usage["inventory_truncated"])
         for row in usage["roles"] + usage["models"]:
             self.assertFalse(row["cost_available"], row["id"])
+            self.assertEqual(
+                row["cost_covered_agents"], row["agents"], row["id"],
+            )
         public = json.dumps(cross, default=str)
-        self.assertNotIn("_agent_records_truncated", public)
+        self.assertNotIn("_agent_records_partial", public)
         self.assertNotIn("_coverage_partial", public)
 
     def test_per_call_result_cap_surfaces_in_cross_session_inventory(self):
@@ -16275,8 +16283,10 @@ class PiSubagentTests(unittest.TestCase):
             cross = self._cross(root)
 
         usage = cross["agent_usage"]
-        self.assertTrue(usage["inventory_truncated"])
+        self.assertFalse(usage["inventory_truncated"])
         self.assertFalse(usage["totals"]["cost_available"])
+        self.assertIsNone(usage["totals"]["cost"])
+        self.assertGreater(usage["totals"]["known_cost"], 0)
 
     def test_calls_within_the_cap_keep_cross_session_inventory_complete(self):
         one_cent = [self._child_result(usage=self._child_usage(10, 1, cost=0.01))]

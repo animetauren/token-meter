@@ -468,8 +468,8 @@ def _finalize_subagent_runs(calls):
 
     Returns ``(runs, partial, truncated)``. ``partial`` is true when any call
     or child evidence was dropped, so nested totals cannot be a complete
-    measurement. ``truncated`` is true when the run cap dropped observable
-    child runs, so the agent inventory is incomplete as well.
+    measurement. ``truncated`` is true when a run cap dropped observable
+    child runs, so cross-session agent totals are partial as well.
     """
     runs = []
     partial = False
@@ -1402,13 +1402,12 @@ class PiRuntimeAdapter:
         row["_tool_evidence"] = compat["summarize_tool_evidence"](tool_calls)
         if agent_records:
             row["_agent_records"] = list(agent_records)
-            # Dropped child evidence keeps cross-session agent totals partial
-            # and, when the run cap dropped children, marks the inventory
-            # truncated. Rows with complete evidence carry neither key.
-            if parsed["subagent_partial"]:
+            # Dropped child evidence, including runs dropped by a run cap,
+            # keeps the affected cross-session agent totals partial without
+            # touching the inventory display limit. Rows with complete
+            # evidence do not carry the key.
+            if parsed["subagent_partial"] or parsed.get("subagent_truncated"):
                 row["_agent_records_partial"] = True
-            if parsed.get("subagent_truncated"):
-                row["_agent_records_truncated"] = True
         return row
 
     def _subagent_records(self, source, runs, *, own):

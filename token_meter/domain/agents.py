@@ -268,12 +268,7 @@ def build_agent_groups(session_rows, *, now=None, max_agents=100):
             continue
         owner_session_id = _opaque_id(session_row.get("id"))
         owner_project = _project_key(session_row.get("project"))
-        inventory_truncated = (
-            session_row.get("_agent_records_truncated") is True
-        )
-        coverage_partial = inventory_truncated or (
-            session_row.get("_agent_records_partial") is True
-        )
+        coverage_partial = session_row.get("_agent_records_partial") is True
         for raw in session_row.get("_agent_records") or []:
             record = _normalize_record(raw, owner_session_id, owner_project)
             if record is None:
@@ -281,8 +276,6 @@ def build_agent_groups(session_rows, *, now=None, max_agents=100):
                 continue
             if coverage_partial:
                 record["_coverage_partial"] = True
-            if inventory_truncated:
-                record["_inventory_truncated"] = True
             candidates[record["id"]].append(record)
 
     records = {}
@@ -341,9 +334,12 @@ def build_agent_groups(session_rows, *, now=None, max_agents=100):
         root_session_id = root.get("session_id") or root.get("_owner_session_id")
         if not root_session_id:
             continue
-        coverage_partial = any(
+        # A session that dropped child evidence has at least one upstream run
+        # this group cannot see; count it so coverage reads "partial".
+        missing_upstream_runs = 1 if any(
             member.get("_coverage_partial") for member in members
-        )
+        ) else 0
+        coverage_total = len(members) + missing_upstream_runs
         members.sort(key=lambda item: (item["depth"], item["id"]))
         totals = _totals(members)
         attention = _attention(members, totals)
@@ -367,11 +363,11 @@ def build_agent_groups(session_rows, *, now=None, max_agents=100):
                 ),
                 "tokens": _coverage(
                     sum(1 for item in members if item["tokens_available"]),
-                    len(members) + coverage_partial, "complete",
+                    coverage_total, "complete",
                 ),
                 "cost": _coverage(
                     sum(1 for item in members if item["cost_available"]),
-                    len(members) + coverage_partial, "estimated",
+                    coverage_total, "estimated",
                 ),
             },
             "totals": totals,
@@ -712,9 +708,7 @@ def aggregate_agent_usage(
     ))
     result["inventory"] = inventory[:max_inventory]
     result["inventory_count"] = len(inventory)
-    result["inventory_truncated"] = len(inventory) > max_inventory or any(
-        record.get("_inventory_truncated") for record, _group in entries
-    )
+    result["inventory_truncated"] = len(inventory) > max_inventory
     windows = (
         ("all", None), ("24h", 86_400), ("7d", 604_800),
         ("30d", 2_592_000), ("90d", 7_776_000),
