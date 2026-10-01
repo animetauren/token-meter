@@ -118,13 +118,26 @@ def _cost_breakdown(value):
     return values if all(item is not None for item in values.values()) else None
 
 
+# Credential prefixes that are distinctive on their own. Matched at a token
+# boundary, case-insensitively, wherever they appear in the value.
 _SECRET_TOKEN_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])(?:"
-    r"sk-|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|xox[abposr]-"
+    r"sk-|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|xox[abposr]-|glpat-"
+    r"|(?:sk|pk|rk)_(?:live|test)_"
     r")",
     re.IGNORECASE,
 )
-_AWS_ACCESS_KEY_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{12,}")
+# Short or word-like prefixes (Hugging Face, npm, xAI, Google API keys) count
+# only when followed by a long unbroken alphanumeric run. Real keys carry
+# 30+ characters there; a 16-character floor keeps ordinary names such as
+# ``xai-researcher`` or ``hf_transformers`` while rejecting key material.
+_SHORT_SECRET_PREFIX_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:hf_|npm_|xai-|aiza)[A-Za-z0-9]{16,}",
+    re.IGNORECASE,
+)
+_AWS_ACCESS_KEY_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{12,}", re.IGNORECASE,
+)
 _JWT_PATTERN = re.compile(
     r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*"
 )
@@ -142,6 +155,7 @@ def _has_secret_token(text):
     """Return whether text carries a credential-shaped token anywhere."""
     return bool(
         _SECRET_TOKEN_PATTERN.search(text)
+        or _SHORT_SECRET_PREFIX_PATTERN.search(text)
         or _AWS_ACCESS_KEY_PATTERN.search(text)
         or _JWT_PATTERN.search(text)
     )
@@ -153,6 +167,10 @@ def _is_host_like(text):
     if re.fullmatch(r"(?:%s|%s|localhost):\d{1,5}" % (_IPV4, _DOTTED_HOST), lowered):
         return True
     if lowered == "localhost" or re.fullmatch(_IPV4, lowered):
+        return True
+    if re.fullmatch(r"%s:\d{4,5}" % _HOST_LABEL, lowered):
+        # Single-label host with a port-shaped tag such as gateway:8080.
+        # Model tags (llama3.1:8b, model:latest, ...-v1:0) do not match.
         return True
     if re.fullmatch(_DOTTED_HOST, lowered):
         # Bare names: require a common host suffix or three or more labels so
@@ -173,8 +191,13 @@ def _has_account_at(text):
             if not re.match(r"[a-z0-9-]+/", rest, re.IGNORECASE):
                 return True
             continue
-        # Vertex-style model@version: the suffix must be a version or tag.
-        if not re.fullmatch(r"(?:\d[0-9A-Za-z._-]*|latest|default)", rest):
+        # Vertex-style model@version: the suffix must be an 8-digit date, a
+        # semantic version with at most three numeric components, or a tag.
+        # Four dotted numbers (an IPv4 address) or any host shape is rejected.
+        if not re.fullmatch(
+            r"(?:\d{8}|v?\d+(?:\.\d+){0,2}|latest|default)", rest,
+            re.IGNORECASE,
+        ) or _is_host_like(rest):
             return True
     return False
 
@@ -216,18 +239,30 @@ def _public_agent_id(*parts):
     return "pi-agent-" + digest
 
 
+_PUBLIC_MODEL_REGISTRY_PREFIXES = frozenset(("hf.co", "huggingface.co"))
+
+
 def _model_id_is_path_like(text):
     """Reject strings shaped like a filesystem or host path, not a model."""
     segments = text.split("/")
-    if len(segments) > 1:
+    # Only a leading public registry (hf.co/org/model) may be a host name.
+    registry_prefix = (
+        len(segments) > 1
+        and segments[0].lower() in _PUBLIC_MODEL_REGISTRY_PREFIXES
+    )
+    if len(segments) > 1 and not registry_prefix:
         first = segments[0].lower()
         if re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+(?::\d+)?", first):
             # Host-shaped namespace such as example.com/secret.
             return True
         if first.split(":", 1)[0] in _MODEL_PATH_ROOT_SEGMENTS:
             return True
-    for segment in segments:
+    for position, segment in enumerate(segments):
         if not segment or segment.startswith("."):
+            return True
+        if _is_host_like(segment) and not (registry_prefix and position == 0):
+            # A host, IP, or host:port in any segment, e.g.
+            # ollama/10.0.0.5:11434 or provider/host.example.com:8443/m.
             return True
         if segment.lower().endswith(_MODEL_FILE_EXTENSIONS):
             return True
@@ -344,8 +379,12 @@ def _subagent_result_runs(details):
     if not isinstance(details, dict):
         return (), 0, False
     results = details.get("results")
-    if not isinstance(results, list):
+    if results is None:
         return (), 0, False
+    if not isinstance(results, list):
+        # A malformed results value still reports that a child ran; with no
+        # top-level usage it becomes one unavailable run, not a skipped call.
+        return (), 1, True
     runs = []
     dropped = False
     for index, result in enumerate(results):
@@ -427,15 +466,18 @@ def _child_activity(run, *, failed_overall=False):
 def _finalize_subagent_runs(calls):
     """Resolve collected calls into bounded observable child runs.
 
-    Returns ``(runs, partial)``. ``partial`` is true when any call or child
-    evidence was dropped, so nested totals cannot be a complete measurement.
+    Returns ``(runs, partial, truncated)``. ``partial`` is true when any call
+    or child evidence was dropped, so nested totals cannot be a complete
+    measurement. ``truncated`` is true when the run cap dropped observable
+    child runs, so the agent inventory is incomplete as well.
     """
     runs = []
     partial = False
+    truncated = False
     now = time.time()
     for evidence in calls.values():
         if len(runs) >= MAX_SUBAGENT_RUNS:
-            partial = True
+            partial = truncated = True
             break
         if not evidence["finished"]:
             call_ts = float(evidence["call_ts"] or 0)
@@ -459,9 +501,15 @@ def _finalize_subagent_runs(calls):
                 # Without an authoritative total, a dropped child is missing
                 # spend rather than a measured zero.
                 partial = True
+            if (
+                len(details) >= MAX_SUBAGENT_RUNS
+                and evidence["details_result_count"] > len(details)
+            ):
+                # The per-call result cap dropped reported children.
+                truncated = True
             for run in details:
                 if len(runs) >= MAX_SUBAGENT_RUNS:
-                    partial = True
+                    partial = truncated = True
                     break
                 state = _child_activity(
                     run, failed_overall=evidence["is_error"],
@@ -492,7 +540,7 @@ def _finalize_subagent_runs(calls):
         runs.append(_subagent_run(
             evidence, role=evidence["role"], failed=evidence["is_error"],
         ))
-    return tuple(runs), partial
+    return tuple(runs), partial, truncated
 
 
 def _nested_usage_totals(runs, partial=False):
@@ -736,13 +784,13 @@ class PiRuntimeAdapter:
         if not self._owned_path(path):
             return {"turns": (), "corrupt": 0, "available": False,
                     "truncated": False, "subagent_runs": (),
-                    "subagent_partial": False}
+                    "subagent_partial": False, "subagent_truncated": False}
         rows, corrupt, available, truncated = _read_jsonl(path)
         header = rows[0] if rows else {}
         if not isinstance(header, dict) or header.get("type") != "session":
             return {"turns": (), "corrupt": corrupt, "available": available,
                     "truncated": truncated, "subagent_runs": (),
-                    "subagent_partial": False}
+                    "subagent_partial": False, "subagent_truncated": False}
         turns = []
         pending_user_ts = 0.0
         previous_ts = 0.0
@@ -868,12 +916,15 @@ class PiRuntimeAdapter:
                 })
                 pending_user_ts = 0.0
             previous_ts = ts or previous_ts
-        subagent_runs, subagent_partial = _finalize_subagent_runs(subagent_calls)
+        subagent_runs, subagent_partial, subagent_truncated = (
+            _finalize_subagent_runs(subagent_calls)
+        )
         return {
             "turns": tuple(turns), "corrupt": corrupt,
             "available": available, "truncated": truncated,
             "subagent_runs": subagent_runs,
             "subagent_partial": subagent_partial,
+            "subagent_truncated": subagent_truncated,
         }
 
     @staticmethod
@@ -1351,6 +1402,13 @@ class PiRuntimeAdapter:
         row["_tool_evidence"] = compat["summarize_tool_evidence"](tool_calls)
         if agent_records:
             row["_agent_records"] = list(agent_records)
+            # Dropped child evidence keeps cross-session agent totals partial
+            # and, when the run cap dropped children, marks the inventory
+            # truncated. Rows with complete evidence carry neither key.
+            if parsed["subagent_partial"]:
+                row["_agent_records_partial"] = True
+            if parsed.get("subagent_truncated"):
+                row["_agent_records_truncated"] = True
         return row
 
     def _subagent_records(self, source, runs, *, own):

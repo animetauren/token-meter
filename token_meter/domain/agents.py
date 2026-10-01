@@ -144,10 +144,13 @@ def _totals(records):
     known_tokens = sum(
         record["tokens"] for record in records if record["tokens"] is not None
     )
-    cost_available = bool(records) and all(
+    # A record whose owning session dropped child evidence (for example a
+    # runtime run cap) cannot make any total that includes it complete.
+    incomplete = any(record.get("_coverage_partial") for record in records)
+    cost_available = bool(records) and not incomplete and all(
         record["cost_available"] for record in records
     )
-    tokens_available = bool(records) and all(
+    tokens_available = bool(records) and not incomplete and all(
         record["tokens_available"] for record in records
     )
     return {
@@ -265,11 +268,21 @@ def build_agent_groups(session_rows, *, now=None, max_agents=100):
             continue
         owner_session_id = _opaque_id(session_row.get("id"))
         owner_project = _project_key(session_row.get("project"))
+        inventory_truncated = (
+            session_row.get("_agent_records_truncated") is True
+        )
+        coverage_partial = inventory_truncated or (
+            session_row.get("_agent_records_partial") is True
+        )
         for raw in session_row.get("_agent_records") or []:
             record = _normalize_record(raw, owner_session_id, owner_project)
             if record is None:
                 invalid_owner_ids.add(owner_session_id)
                 continue
+            if coverage_partial:
+                record["_coverage_partial"] = True
+            if inventory_truncated:
+                record["_inventory_truncated"] = True
             candidates[record["id"]].append(record)
 
     records = {}
@@ -328,6 +341,9 @@ def build_agent_groups(session_rows, *, now=None, max_agents=100):
         root_session_id = root.get("session_id") or root.get("_owner_session_id")
         if not root_session_id:
             continue
+        coverage_partial = any(
+            member.get("_coverage_partial") for member in members
+        )
         members.sort(key=lambda item: (item["depth"], item["id"]))
         totals = _totals(members)
         attention = _attention(members, totals)
@@ -351,11 +367,11 @@ def build_agent_groups(session_rows, *, now=None, max_agents=100):
                 ),
                 "tokens": _coverage(
                     sum(1 for item in members if item["tokens_available"]),
-                    len(members), "complete",
+                    len(members) + coverage_partial, "complete",
                 ),
                 "cost": _coverage(
                     sum(1 for item in members if item["cost_available"]),
-                    len(members), "estimated",
+                    len(members) + coverage_partial, "estimated",
                 ),
             },
             "totals": totals,
@@ -696,7 +712,9 @@ def aggregate_agent_usage(
     ))
     result["inventory"] = inventory[:max_inventory]
     result["inventory_count"] = len(inventory)
-    result["inventory_truncated"] = len(inventory) > max_inventory
+    result["inventory_truncated"] = len(inventory) > max_inventory or any(
+        record.get("_inventory_truncated") for record, _group in entries
+    )
     windows = (
         ("all", None), ("24h", 86_400), ("7d", 604_800),
         ("30d", 2_592_000), ("90d", 7_776_000),

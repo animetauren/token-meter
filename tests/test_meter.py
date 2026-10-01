@@ -16225,6 +16225,75 @@ class PiSubagentTests(unittest.TestCase):
                 self.assertFalse(summary["availability"]["cost"])
                 self.assertFalse(state["availability"]["cost"])
 
+    def test_non_list_results_without_usage_is_an_unavailable_run(self):
+        for results in ("not-a-list", {"agent": "probe"}, 7):
+            with self.subTest(results=results), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "agent"
+                # Written raw: details.results is the malformed value itself.
+                self._write_many_calls(root, [results])
+                _source, state, summary = self._load(root)
+
+                children = [
+                    record for record in summary.get("_agent_records", [])
+                    if record["kind"] == "spawned"
+                ]
+                self.assertEqual(len(children), 1)
+                self.assertFalse(children[0]["tokens_available"])
+                self.assertFalse(children[0]["cost_available"])
+                self.assertFalse(summary["availability"]["cost"])
+                self.assertFalse(state["availability"]["cost"])
+
+    def test_call_cap_surfaces_in_cross_session_agent_inventory(self):
+        one_cent = [self._child_result(usage=self._child_usage(10, 1, cost=0.01))]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_many_calls(root, [one_cent] * 600)
+            _source, _state, summary = self._load(root)
+            cross = self._cross(root)
+
+        self.assertTrue(summary["_agent_records_truncated"])
+        usage = cross["agent_usage"]
+        self.assertEqual(usage["totals"]["agents"], pi_runtime.MAX_SUBAGENT_RUNS)
+        self.assertFalse(usage["totals"]["cost_available"])
+        self.assertFalse(usage["totals"]["tokens_available"])
+        self.assertIsNone(usage["totals"]["cost"])
+        self.assertTrue(usage["inventory_truncated"])
+        for row in usage["roles"] + usage["models"]:
+            self.assertFalse(row["cost_available"], row["id"])
+        public = json.dumps(cross, default=str)
+        self.assertNotIn("_agent_records_truncated", public)
+        self.assertNotIn("_coverage_partial", public)
+
+    def test_per_call_result_cap_surfaces_in_cross_session_inventory(self):
+        wide = [
+            self._child_result(usage=self._child_usage(10, 1, cost=0.01))
+            for _ in range(pi_runtime.MAX_SUBAGENT_RUNS + 5)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_many_calls(root, [wide])
+            cross = self._cross(root)
+
+        usage = cross["agent_usage"]
+        self.assertTrue(usage["inventory_truncated"])
+        self.assertFalse(usage["totals"]["cost_available"])
+
+    def test_calls_within_the_cap_keep_cross_session_inventory_complete(self):
+        one_cent = [self._child_result(usage=self._child_usage(10, 1, cost=0.01))]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_many_calls(root, [one_cent] * 3)
+            _source, _state, summary = self._load(root)
+            cross = self._cross(root)
+
+        self.assertNotIn("_agent_records_truncated", summary)
+        self.assertNotIn("_agent_records_partial", summary)
+        usage = cross["agent_usage"]
+        self.assertEqual(usage["totals"]["agents"], 3)
+        self.assertTrue(usage["totals"]["cost_available"])
+        self.assertTrue(usage["totals"]["tokens_available"])
+        self.assertFalse(usage["inventory_truncated"])
+
     def test_repeated_call_id_does_not_overwrite_finished_evidence(self):
         repeat = {
             "type": "message", "id": "assistant-repeat",
@@ -16296,6 +16365,17 @@ class PiSubagentTests(unittest.TestCase):
             "amazon.nova-pro-v1:0", "claude-opus-4@20250514",
             "@cf/meta/llama-3.1-8b-instruct",
             "us.anthropic.claude-sonnet-4-20250514-v1:0",
+            "us.anthropic.claude-opus-5-5-v1:0",
+            "eu.anthropic.claude-sonnet-5-5-v1:0",
+            "meta.llama3-70b-instruct-v1:0", "claude-sonnet-4@20250514",
+            "model@latest", "model@v2.1.0", "model@1.2", "model@v1",
+            "@cf/meta/llama-3-8b", "accounts/fireworks/models/x",
+            "openrouter/anthropic/claude-opus-5-5", "gemini-2.5-pro",
+            "deepseek-r1:70b", "qwen2.5-coder:7b", "gpt-oss:20b",
+            "phi3:3.8b", "model:latest", "hf.co/unsloth/model",
+            "huggingface.co/org/model",
+            # Short vendor prefixes followed by an ordinary word stay names.
+            "xai-researcher", "hf_transformers",
         )
         rejected = (
             "internal.corp.example.com:8443", "10.0.0.5:11434", "10.0.0.5",
@@ -16306,6 +16386,21 @@ class PiSubagentTests(unittest.TestCase):
             "ghp_abcdefghijklmnop", "gho_abcdefghijklmnop",
             "github_pat_11ABCDEFG", "xoxb-1234-5678-abcd", "xoxp-1234-5678",
             "AKIAIOSFODNN7EXAMPLE", "vendor/AKIAIOSFODNN7EXAMPLE",
+            # Host, IP, or host:port in any path segment.
+            "ollama/10.0.0.5:11434", "provider/host.example.com:8443/m",
+            "hf.co/10.0.0.5:8080/model", "vendor/gateway:8080",
+            # Account or host after @ instead of a version.
+            "bob@10.0.0.5", "model@1.2.3.4", "a@1host.corp.com",
+            "ollama@192.168.1.4", "model@2.example.com",
+            # Single-label host with a port-shaped tag.
+            "myhost:11434", "gateway:8080",
+            # Additional vendor credential prefixes, any case.
+            "hf_AbCdEfGhIjKlMnOpQrStUvWx", "HF_AbCdEfGhIjKlMnOpQrStUvWx",
+            "xai-AbCdEfGhIjKlMnOpQrStUv", "AIzaSyA1234567890abcdefghij",
+            "glpat-abcdefgh", "GLPAT-abcdefgh", "npm_AbCdEfGhIjKlMnOpQrStUv",
+            "sk_live_abc123", "sk_test_abc123", "pk_live_abc123",
+            "rk_live_abc123", "akiaiosfodnn7example",
+            "vendor/glpat-abcdefgh",
         )
         for value in accepted:
             self.assertEqual(pi_runtime._subagent_model_id(value), value)
@@ -16330,11 +16425,19 @@ class PiSubagentTests(unittest.TestCase):
                 self.assertNotIn(value.lower(), encoded)
 
     def test_child_role_rejects_secret_token_shapes(self):
-        accepted = ("probe", "scout", "task-runner", "worker_2", "skeptic")
+        accepted = (
+            "probe", "scout", "task-runner", "worker_2", "skeptic",
+            # Short prefixes need a 16+ character key-like run to count.
+            "xai-researcher", "hf_helper", "npm_runner", "aizawa",
+        )
         rejected = (
             "sk-abcdef", "my-sk-abcdef", "ghp_abcdef", "gho_abcdef",
             "github_pat_11ABC", "xoxb-1234", "xoxp-1234",
-            "AKIAIOSFODNN7EXAMPLE",
+            "AKIAIOSFODNN7EXAMPLE", "akiaiosfodnn7example",
+            "hf_AbCdEfGhIjKlMnOpQr", "xai-AbCdEfGhIjKlMnOpQr",
+            "npm_AbCdEfGhIjKlMnOpQr", "AIzaSyA1234567890abcdef",
+            "glpat-abcdef", "sk_live_abc", "sk_test_abc", "pk_live_abc",
+            "rk_live_abc", "worker-glpat-x",
         )
         for value in accepted:
             self.assertEqual(pi_runtime._safe_agent_role(value), value)
