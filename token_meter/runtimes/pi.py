@@ -118,6 +118,67 @@ def _cost_breakdown(value):
     return values if all(item is not None for item in values.values()) else None
 
 
+_SECRET_TOKEN_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"sk-|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|xox[abposr]-"
+    r")",
+    re.IGNORECASE,
+)
+_AWS_ACCESS_KEY_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{12,}")
+_JWT_PATTERN = re.compile(
+    r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*"
+)
+_HOST_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_IPV4 = r"\d{1,3}(?:\.\d{1,3}){3}"
+_DOTTED_HOST = r"(?:%s\.)+[a-z]{2,63}" % _HOST_LABEL
+_COMMON_HOST_SUFFIXES = frozenset((
+    "com", "net", "org", "io", "dev", "app", "cloud", "local", "lan",
+    "internal", "corp", "intranet", "localdomain", "home", "test",
+    "example", "invalid", "localhost",
+))
+
+
+def _has_secret_token(text):
+    """Return whether text carries a credential-shaped token anywhere."""
+    return bool(
+        _SECRET_TOKEN_PATTERN.search(text)
+        or _AWS_ACCESS_KEY_PATTERN.search(text)
+        or _JWT_PATTERN.search(text)
+    )
+
+
+def _is_host_like(text):
+    """Return whether the whole value is a hostname, IP, or host:port."""
+    lowered = text.lower()
+    if re.fullmatch(r"(?:%s|%s|localhost):\d{1,5}" % (_IPV4, _DOTTED_HOST), lowered):
+        return True
+    if lowered == "localhost" or re.fullmatch(_IPV4, lowered):
+        return True
+    if re.fullmatch(_DOTTED_HOST, lowered):
+        # Bare names: require a common host suffix or three or more labels so
+        # dotted vendor ids keep working.
+        labels = lowered.split(".")
+        return labels[-1] in _COMMON_HOST_SUFFIXES or len(labels) >= 3
+    return False
+
+
+def _has_account_at(text):
+    """Reject user@host shapes while keeping @cf/ and model@version ids."""
+    for position, char in enumerate(text):
+        if char != "@":
+            continue
+        rest = text[position + 1:]
+        if position == 0:
+            # Leading namespace such as Cloudflare's @cf/ or @hf/.
+            if not re.match(r"[a-z0-9-]+/", rest, re.IGNORECASE):
+                return True
+            continue
+        # Vertex-style model@version: the suffix must be a version or tag.
+        if not re.fullmatch(r"(?:\d[0-9A-Za-z._-]*|latest|default)", rest):
+            return True
+    return False
+
+
 def _safe_agent_role(value, limit=64):
     """Keep a short provider-reported agent name, never arbitrary prose."""
     if not isinstance(value, str):
@@ -136,6 +197,7 @@ def _safe_agent_role(value, limit=64):
         or any(marker in lowered for marker in (
             "api_key=", "api-key=", "secret=", "token=",
         ))
+        or _has_secret_token(text)
     ):
         return ""
     if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", text):
@@ -190,6 +252,9 @@ def _subagent_model_id(value):
         or any(marker in lowered for marker in (
             "api_key=", "api-key=", "secret=", "token=",
         ))
+        or _has_secret_token(text)
+        or _is_host_like(text)
+        or _has_account_at(text)
     ):
         return ""
     return text
@@ -271,15 +336,21 @@ def _subagent_usage(value):
 
 
 def _subagent_result_runs(details):
-    """Read only the documented structural result fields; drop child content."""
+    """Read only the documented structural result fields; drop child content.
+
+    Returns the bounded runs, the number of reported result entries, and
+    whether any reported entry was dropped (malformed or over the cap).
+    """
     if not isinstance(details, dict):
-        return ()
+        return (), 0, False
     results = details.get("results")
     if not isinstance(results, list):
-        return ()
+        return (), 0, False
     runs = []
+    dropped = False
     for index, result in enumerate(results):
         if len(runs) >= MAX_SUBAGENT_RUNS or not isinstance(result, dict):
+            dropped = True
             continue
         runs.append({
             "index": index,
@@ -289,7 +360,7 @@ def _subagent_result_runs(details):
             "exit_code": _integer(result.get("exitCode")),
             "stop_reason": _subagent_stop_reason(result.get("stopReason")),
         })
-    return tuple(runs)
+    return tuple(runs), len(results), dropped
 
 
 def _subagent_run(evidence, *, index=0, role="", model="", usage=None,
@@ -354,11 +425,17 @@ def _child_activity(run, *, failed_overall=False):
 
 
 def _finalize_subagent_runs(calls):
-    """Resolve collected calls into bounded observable child runs."""
+    """Resolve collected calls into bounded observable child runs.
+
+    Returns ``(runs, partial)``. ``partial`` is true when any call or child
+    evidence was dropped, so nested totals cannot be a complete measurement.
+    """
     runs = []
+    partial = False
     now = time.time()
     for evidence in calls.values():
         if len(runs) >= MAX_SUBAGENT_RUNS:
+            partial = True
             break
         if not evidence["finished"]:
             call_ts = float(evidence["call_ts"] or 0)
@@ -378,7 +455,14 @@ def _finalize_subagent_runs(calls):
             )
         )
         if use_details:
+            if evidence["details_dropped"] and evidence["usage"] is None:
+                # Without an authoritative total, a dropped child is missing
+                # spend rather than a measured zero.
+                partial = True
             for run in details:
+                if len(runs) >= MAX_SUBAGENT_RUNS:
+                    partial = True
+                    break
                 state = _child_activity(
                     run, failed_overall=evidence["is_error"],
                 )
@@ -402,23 +486,23 @@ def _finalize_subagent_runs(calls):
                 failed=evidence["is_error"],
             ))
             continue
-        if evidence["details_present"]:
-            # A result with no results and no usage ran no child.
+        if evidence["details_present"] and not evidence["details_result_count"]:
+            # A result with no reported results and no usage ran no child.
             continue
         runs.append(_subagent_run(
             evidence, role=evidence["role"], failed=evidence["is_error"],
         ))
-    return tuple(runs)
+    return tuple(runs), partial
 
 
-def _nested_usage_totals(runs):
+def _nested_usage_totals(runs, partial=False):
     """Return additive nested spend and its explicit coverage flags."""
     totals = {
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_write_tokens": 0,
         "tokens": 0, "total_cost": 0.0,
-        "tokens_available": True, "cache_available": True,
-        "cost_available": True,
+        "tokens_available": not partial, "cache_available": not partial,
+        "cost_available": not partial,
     }
     for run in runs or ():
         usage = run.get("usage") if isinstance(run, dict) else None
@@ -651,12 +735,14 @@ class PiRuntimeAdapter:
     def _parsed(self, path):
         if not self._owned_path(path):
             return {"turns": (), "corrupt": 0, "available": False,
-                    "truncated": False, "subagent_runs": ()}
+                    "truncated": False, "subagent_runs": (),
+                    "subagent_partial": False}
         rows, corrupt, available, truncated = _read_jsonl(path)
         header = rows[0] if rows else {}
         if not isinstance(header, dict) or header.get("type") != "session":
             return {"turns": (), "corrupt": corrupt, "available": available,
-                    "truncated": truncated, "subagent_runs": ()}
+                    "truncated": truncated, "subagent_runs": (),
+                    "subagent_partial": False}
         turns = []
         pending_user_ts = 0.0
         previous_ts = 0.0
@@ -695,7 +781,11 @@ class PiRuntimeAdapter:
                     evidence["is_error"] = message.get("isError") is True
                     evidence["usage"] = _subagent_usage(message.get("usage"))
                     evidence["details_present"] = isinstance(details, dict)
-                    evidence["details_runs"] = _subagent_result_runs(details)
+                    (
+                        evidence["details_runs"],
+                        evidence["details_result_count"],
+                        evidence["details_dropped"],
+                    ) = _subagent_result_runs(details)
             elif role == "assistant" and len(turns) < MAX_TURNS:
                 provider = str(message.get("provider") or provider)
                 model = str(message.get("model") or model)
@@ -737,7 +827,12 @@ class PiRuntimeAdapter:
                     tools.append(tool)
                     if tool["id"]:
                         tools_by_call_id[tool["id"]] = tool
-                    if tool["name"] == SUBAGENT_TOOL_NAME and tool["id"]:
+                    existing = subagent_calls.get(tool["id"])
+                    if (
+                        tool["name"] == SUBAGENT_TOOL_NAME and tool["id"]
+                        and not (existing and existing["finished"])
+                    ):
+                        # A repeated ID never replaces finished evidence.
                         subagent_calls[tool["id"]] = {
                             "call_id": tool["id"],
                             "call_ts": ts or previous_ts,
@@ -748,6 +843,8 @@ class PiRuntimeAdapter:
                             "usage": None,
                             "details_present": False,
                             "details_runs": (),
+                            "details_result_count": 0,
+                            "details_dropped": False,
                             "finished": False,
                             "is_error": False,
                         }
@@ -771,10 +868,12 @@ class PiRuntimeAdapter:
                 })
                 pending_user_ts = 0.0
             previous_ts = ts or previous_ts
+        subagent_runs, subagent_partial = _finalize_subagent_runs(subagent_calls)
         return {
             "turns": tuple(turns), "corrupt": corrupt,
             "available": available, "truncated": truncated,
-            "subagent_runs": _finalize_subagent_runs(subagent_calls),
+            "subagent_runs": subagent_runs,
+            "subagent_partial": subagent_partial,
         }
 
     @staticmethod
@@ -790,7 +889,9 @@ class PiRuntimeAdapter:
             raise ValueError("source belongs to another runtime")
         parsed = self._parsed(source.locator.value)
         turns = parsed["turns"]
-        nested = _nested_usage_totals(parsed["subagent_runs"])
+        nested = _nested_usage_totals(
+            parsed["subagent_runs"], parsed["subagent_partial"],
+        )
         tokens_available = (
             bool(turns) and all(turn["token_available"] for turn in turns)
             and nested["tokens_available"]
@@ -813,7 +914,7 @@ class PiRuntimeAdapter:
             warning_codes.append("corrupt_rows")
         if not tokens_available:
             warning_codes.append("usage_unavailable")
-        if parsed["truncated"]:
+        if parsed["truncated"] or parsed["subagent_partial"]:
             warning_codes.append("history_truncated")
         messages = {
             "corrupt_rows": "Malformed Pi rows were ignored.",
@@ -1010,7 +1111,7 @@ class PiRuntimeAdapter:
                 })
         primary_model = max(model_tok, key=model_tok.get) if model_tok else source.get("model")
         own_output = tot["output"]
-        nested = _nested_usage_totals(runs)
+        nested = _nested_usage_totals(runs, parsed["subagent_partial"])
         for run in runs:
             usage = run.get("usage")
             if not usage:
@@ -1151,7 +1252,7 @@ class PiRuntimeAdapter:
             else source.get("model")
         )
         own_terminal = bool(turns and turns[-1]["stop_reason"] == "stop")
-        nested = _nested_usage_totals(runs)
+        nested = _nested_usage_totals(runs, parsed["subagent_partial"])
         for run in runs:
             usage = run.get("usage")
             if not usage:
@@ -1305,8 +1406,12 @@ class PiRuntimeAdapter:
         }]
         for run in runs:
             usage = run.get("usage")
+            cache_available = bool(usage and usage["cache_available"])
+            # The child token total includes cache buckets, so a missing
+            # cache report leaves that total partial rather than measured.
             tokens_available = bool(
                 usage and usage["input_available"] and usage["output_available"]
+                and cache_available
             )
             cost_available = bool(usage and usage["cost_available"])
             started = run.get("started_at")
@@ -1342,6 +1447,7 @@ class PiRuntimeAdapter:
                 "reasoning_tokens": usage["reasoning_tokens"] if usage else 0,
                 "tokens": usage["tokens"] if tokens_available else None,
                 "tokens_available": tokens_available,
+                "cache_available": cache_available,
                 "cost": usage["total_cost"] if cost_available else None,
                 "cost_available": cost_available,
                 "executions": run.get("executions") or 0,

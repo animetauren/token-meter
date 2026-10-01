@@ -426,7 +426,8 @@ session's agent group with their provider-reported agent name, model, duration,
 and completion state. Token Meter reads only the structural result fields of
 that tool; child prompts, tasks, messages, stderr, and outputs stay unread. A
 child that reports no usage keeps its tokens and cost unavailable rather than
-zero.
+zero, and a session with more child runs than Token Meter retains shows its
+totals as unavailable rather than as a complete figure.
 
 ### Costs and estimates
 

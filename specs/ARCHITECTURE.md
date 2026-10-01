@@ -138,7 +138,8 @@ stderr, and outputs are never read. A top-level result `usage` is authoritative
 when Pi reports one and a per-child split is attributed only when it reconciles
 exactly; otherwise one aggregate run carries the total. A run without usage
 evidence reports unavailable tokens and cost and makes the session coverage
-partial rather than folding an unknown into a complete total. A child whose
+partial rather than folding an unknown into a complete total; the same holds
+when the bounded child-run cap drops a call or child. A child whose
 model is unreported or fails sanitization is attributed to an explicit
 `unknown-model` key, never to the parent's model. A root agent record derives
 its own completion from the final assistant turn's recorded stop reason, while

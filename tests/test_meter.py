@@ -18,6 +18,7 @@ from unittest import mock
 import meter
 from token_meter.contracts import DiscoveryContext
 from token_meter.runtimes.codex import CodexRuntimeAdapter
+from token_meter.runtimes import pi as pi_runtime
 
 
 class BuilderRecapDomainTests(unittest.TestCase):
@@ -16105,6 +16106,256 @@ class PiSubagentTests(unittest.TestCase):
         self.assertNotIn("_agent_records", summary)
         # A non-subagent Pi session keeps its pre-existing session liveness.
         self.assertFalse(summary["terminal"])
+
+    def _write_many_calls(self, agent_root, call_results, *, extra_rows=()):
+        """Write one parent turn issuing N subagent calls with given results."""
+        directory = Path(agent_root) / "sessions" / "--repo--"
+        directory.mkdir(parents=True)
+        path = directory / "pi-subagent-many.jsonl"
+        calls = [
+            {"type": "toolCall", "id": "call-{}".format(index),
+             "name": "subagent", "arguments": {"agent": "probe"}}
+            for index in range(len(call_results))
+        ]
+        rows = [
+            {"type": "session", "version": 3, "id": "pi-session",
+             "timestamp": "2026-09-04T10:00:00Z", "cwd": "/repo"},
+            {"type": "message", "id": "user", "timestamp": "2026-09-04T10:00:01Z",
+             "message": {"role": "user", "content": []}},
+            {"type": "message", "id": "assistant",
+             "timestamp": "2026-09-04T10:00:02Z",
+             "message": {
+                 "role": "assistant", "model": "claude-test",
+                 "provider": "anthropic", "stopReason": "stop",
+                 "content": calls,
+                 "usage": {"input": 100, "output": 20, "cacheRead": 10,
+                           "cacheWrite": 5,
+                           "cost": {"input": 0.001, "output": 0.002,
+                                    "cacheRead": 0.0001, "cacheWrite": 0.0002}},
+             }},
+        ]
+        for index, results in enumerate(call_results):
+            rows.append({
+                "type": "message", "id": "result-{}".format(index),
+                "timestamp": "2026-09-04T10:00:05Z",
+                "message": {
+                    "role": "toolResult", "toolCallId": "call-{}".format(index),
+                    "toolName": "subagent",
+                    "details": {"mode": "single", "results": results},
+                },
+            })
+        rows.extend(extra_rows)
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        return path
+
+    def _native_load(self, root):
+        adapter = pi_runtime.PiRuntimeAdapter(root)
+        source = adapter.discover(DiscoveryContext(home="/home/test"))[0]
+        return adapter.load(source, meter.DetailLevel.SUMMARY)
+
+    def test_call_cap_marks_nested_spend_partial_not_complete(self):
+        one_cent = [self._child_result(usage=self._child_usage(10, 1, cost=0.01))]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_many_calls(root, [one_cent] * 600)
+            _source, state, summary = self._load(root)
+            loaded = self._native_load(root)
+
+        children = [
+            record for record in summary["_agent_records"]
+            if record["kind"] == "spawned"
+        ]
+        self.assertLessEqual(len(children), pi_runtime.MAX_SUBAGENT_RUNS)
+        for payload in (state, summary):
+            self.assertFalse(payload["availability"]["cost"])
+            self.assertFalse(payload["availability"]["tokens"])
+            self.assertFalse(payload["availability"]["cache"])
+        self.assertIsNone(loaded.usage.cost_usd.value)
+        self.assertIsNone(loaded.usage.input_tokens.value)
+        self.assertIsNone(loaded.usage.cache_read_tokens.value)
+        self.assertIn("history_truncated",
+                      [warning.code for warning in loaded.warnings])
+
+    def test_per_call_details_respect_the_run_cap(self):
+        single = [self._child_result(usage=self._child_usage(10, 1, cost=0.01))]
+        wide = [
+            self._child_result(usage=self._child_usage(10, 1, cost=0.01))
+            for _ in range(pi_runtime.MAX_SUBAGENT_RUNS)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_many_calls(
+                root, [single] * (pi_runtime.MAX_SUBAGENT_RUNS - 1) + [wide],
+            )
+            _source, state, summary = self._load(root)
+
+        children = [
+            record for record in summary["_agent_records"]
+            if record["kind"] == "spawned"
+        ]
+        self.assertEqual(len(children), pi_runtime.MAX_SUBAGENT_RUNS)
+        self.assertFalse(summary["availability"]["cost"])
+        self.assertFalse(state["availability"]["cost"])
+
+    def test_calls_within_the_cap_stay_complete(self):
+        one_cent = [self._child_result(usage=self._child_usage(10, 1, cost=0.01))]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_many_calls(root, [one_cent] * 3)
+            _source, state, summary = self._load(root)
+
+        self.assertTrue(summary["availability"]["cost"])
+        self.assertTrue(state["availability"]["cost"])
+        self.assertAlmostEqual(state["total_cost"], 0.0333)
+
+    def test_nonempty_results_without_valid_entries_is_an_unavailable_run(self):
+        for results in (["not-a-dict"], [None, 7], [["nested"]]):
+            with self.subTest(results=results), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "agent"
+                self._write_subagent_session(root, results=results)
+                _source, state, summary = self._load(root)
+
+                children = [
+                    record for record in summary.get("_agent_records", [])
+                    if record["kind"] == "spawned"
+                ]
+                self.assertEqual(len(children), 1)
+                self.assertFalse(children[0]["tokens_available"])
+                self.assertFalse(children[0]["cost_available"])
+                self.assertFalse(summary["availability"]["cost"])
+                self.assertFalse(state["availability"]["cost"])
+
+    def test_repeated_call_id_does_not_overwrite_finished_evidence(self):
+        repeat = {
+            "type": "message", "id": "assistant-repeat",
+            "timestamp": "2026-09-04T10:00:09Z",
+            "message": {
+                "role": "assistant", "model": "claude-test",
+                "provider": "anthropic", "stopReason": "stop",
+                "content": [{"type": "toolCall", "id": "call-0",
+                             "name": "subagent",
+                             "arguments": {"agent": "other"}}],
+                "usage": {"input": 1, "output": 1, "cacheRead": 0,
+                          "cacheWrite": 0,
+                          "cost": {"input": 0.0, "output": 0.0,
+                                   "cacheRead": 0.0, "cacheWrite": 0.0}},
+            },
+        }
+        result = [self._child_result(usage=self._child_usage(cost=0.25))]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_many_calls(root, [result], extra_rows=[repeat])
+            _source, state, summary = self._load(root)
+
+        children = [
+            record for record in summary["_agent_records"]
+            if record["kind"] == "spawned"
+        ]
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0]["role"], "probe")
+        self.assertEqual(children[0]["activity_state"], "complete")
+        self.assertAlmostEqual(children[0]["cost"], 0.25)
+        self.assertTrue(state["availability"]["cost"])
+        self.assertAlmostEqual(state["total_cost"], 0.2533)
+
+    def test_child_without_cache_keys_is_not_a_complete_token_total(self):
+        usage = self._child_usage()
+        del usage["cacheRead"]
+        del usage["cacheWrite"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agent"
+            self._write_subagent_session(
+                root, results=[self._child_result(usage=usage)],
+            )
+            _source, state, summary = self._load(root)
+
+        child = self._records(summary)["spawned"]
+        self.assertFalse(child["cache_available"])
+        self.assertFalse(child["tokens_available"])
+        self.assertIsNone(child["tokens"])
+        self.assertFalse(summary["availability"]["cache"])
+        self.assertFalse(state["availability"]["cache"])
+
+    def _cross(self, root):
+        saved = dict(meter._xsess)
+        try:
+            meter._xsess.update({"data": None, "at": 0, "agent_groups": ()})
+            with mock.patch.object(meter, "PI_AGENT_DIR", str(root)), \
+                    mock.patch.object(meter, "_pi_native_adapters", {}), \
+                    mock.patch.object(meter, "_RUNTIME_REGISTRY", None), \
+                    mock.patch.object(meter, "capability_inventory", return_value={}):
+                return meter.cross_session(sources=meter.pi_session_sources())
+        finally:
+            meter._xsess.clear()
+            meter._xsess.update(saved)
+
+    def test_child_model_sanitizer_table(self):
+        accepted = (
+            "claude-opus-5-5", "anthropic/claude-sonnet-5-5", "openai/gpt-5.6",
+            "gpt-5.6-sol", "grok-4.7", "llama3.1:8b", "qwen2.5-coder:32b",
+            "amazon.nova-pro-v1:0", "claude-opus-4@20250514",
+            "@cf/meta/llama-3.1-8b-instruct",
+            "us.anthropic.claude-sonnet-4-20250514-v1:0",
+        )
+        rejected = (
+            "internal.corp.example.com:8443", "10.0.0.5:11434", "10.0.0.5",
+            "localhost:8080", "internal.corp.example.com",
+            "alice@corp.example.com", "user@host", "model@corp.example.com",
+            "sk-proj-abc123", "openai/sk-proj-abc123",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl",
+            "ghp_abcdefghijklmnop", "gho_abcdefghijklmnop",
+            "github_pat_11ABCDEFG", "xoxb-1234-5678-abcd", "xoxp-1234-5678",
+            "AKIAIOSFODNN7EXAMPLE", "vendor/AKIAIOSFODNN7EXAMPLE",
+        )
+        for value in accepted:
+            self.assertEqual(pi_runtime._subagent_model_id(value), value)
+        for value in rejected:
+            self.assertEqual(pi_runtime._subagent_model_id(value), "", value)
+        for value in rejected:
+            with self.subTest(model=value), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "agent"
+                self._write_subagent_session(root, results=[
+                    self._child_result(usage=self._child_usage(), model=value),
+                ])
+                _source, state, summary = self._load(root)
+                cross = self._cross(root)
+
+                child = self._records(summary)["spawned"]
+                self.assertEqual(child["model"], "unknown-model")
+                encoded = json.dumps(
+                    {"summary": summary, "state": state, "cross": cross},
+                    default=str,
+                )
+                self.assertNotIn(value, encoded)
+                self.assertNotIn(value.lower(), encoded)
+
+    def test_child_role_rejects_secret_token_shapes(self):
+        accepted = ("probe", "scout", "task-runner", "worker_2", "skeptic")
+        rejected = (
+            "sk-abcdef", "my-sk-abcdef", "ghp_abcdef", "gho_abcdef",
+            "github_pat_11ABC", "xoxb-1234", "xoxp-1234",
+            "AKIAIOSFODNN7EXAMPLE",
+        )
+        for value in accepted:
+            self.assertEqual(pi_runtime._safe_agent_role(value), value)
+        for value in rejected:
+            self.assertEqual(pi_runtime._safe_agent_role(value), "", value)
+        for value in rejected:
+            with self.subTest(role=value), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "agent"
+                self._write_subagent_session(
+                    root, arguments={"agent": value},
+                    results=[self._child_result(value, usage=self._child_usage())],
+                )
+                _source, state, summary = self._load(root)
+                cross = self._cross(root)
+
+                self.assertIsNone(self._records(summary)["spawned"]["role"])
+                encoded = json.dumps(
+                    {"summary": summary, "state": state, "cross": cross},
+                    default=str,
+                )
+                self.assertNotIn(value, encoded)
 
     def test_canonical_agent_sources_selects_pi_rows(self):
         source = {
