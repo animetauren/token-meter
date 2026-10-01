@@ -158,15 +158,20 @@ Comparisons are therefore cached per pair, keyed by the local day plus a digest
 of each side's samples, so a new turn for one model rebuilds only the pairs that
 model takes part in and a day rollover never reuses previous-day windows. The
 global pair cache is bounded, written to the Token Meter state directory only
-when an entry changed, and reloaded on start with per-entry shape and
-finite-number validation, so a restart reuses unchanged pairs instead of
-rebuilding every pair. Project-scoped model stats compute from a private,
-unpersisted pair cache and never evict or overwrite global entries. Only model and runtime identifiers and aggregate duration, token,
-ratio, and coverage values are stored; the file carries no prompt, response,
-tool, path, or raw trace content. Persistence is enabled only by the server
-entrypoint, so importing the module never writes the user's cache. A rebuild
-runs outside the cache lock and is single-flighted, so one slow rebuild neither
-blocks requests that already have fresh data nor runs concurrently with itself.
+when an entry changed, and reloaded on start with per-entry validation that
+rebuilds each comparison from the builder's exact key allowlist, bounds every
+number, and skips a malformed entry without failing the request, so a restart
+reuses unchanged pairs instead of rebuilding every pair. Once the cap is
+reached, new pairs are computed but not admitted, so cached pairs are never
+evicted and an unchanged over-cap history is never rewritten. Project-scoped
+model stats compute from a private, unpersisted pair cache and never evict or
+overwrite global entries. Only model and runtime identifiers and aggregate
+duration, token, ratio, and coverage values are stored; the file carries no
+prompt, response, tool, path, or raw trace content. Persistence is enabled only
+by the server entrypoint, so importing the module never writes the user's
+cache. A rebuild runs outside the cache lock and is single-flighted, so one
+slow rebuild neither blocks requests that already have fresh data nor runs
+concurrently with itself.
 
 ## Application State and Caching
 

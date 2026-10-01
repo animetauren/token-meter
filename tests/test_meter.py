@@ -3623,6 +3623,131 @@ class ModelPerformanceTests(unittest.TestCase):
                 meter.matched_pace_windows(groups, now_ts=now)
             self.assertEqual(len(meter._matched_pace_pair_cache), 3)
 
+    def test_matched_pace_skips_entries_with_huge_integers_without_raising(self):
+        now = datetime.datetime(2026, 8, 11, 12, 0, 0).timestamp()
+        groups = self._pace_groups(now)
+        expected = meter.matched_pace_windows(groups, now_ts=now)
+        stored = json.loads(self._pace_cache_path.read_text())
+        huge = "9" * 400
+        # json.loads decodes a bare 400-digit literal as a Python int, for
+        # which math.isfinite raises OverflowError.
+        for field in ("pace_ratio", "matched_pairs"):
+            with self.subTest(field=field):
+                payload = json.loads(json.dumps(stored))
+                payload["pairs"][0]["windows"]["all"][field] = "HUGE"
+                text = json.dumps(payload).replace('"HUGE"', huge)
+                self._pace_cache_path.write_text(text)
+                self._drop_pace_memory()
+                original = meter.matched_pace_comparison
+                with mock.patch.object(
+                    meter, "matched_pace_comparison", wraps=original,
+                ) as comparison:
+                    result = meter.matched_pace_windows(groups, now_ts=now)
+                self.assertEqual(result, expected)
+                self.assertEqual(result, self._cold_pace(groups, now))
+                # Only the corrupted pair is recomputed; the others are kept.
+                self.assertEqual(comparison.call_count, 6)
+
+    def test_matched_pace_persisted_entries_cannot_inject_output_fields(self):
+        now = datetime.datetime(2026, 8, 11, 12, 0, 0).timestamp()
+        groups = self._pace_groups(now)
+        expected = meter.matched_pace_windows(groups, now_ts=now)
+        stored = json.loads(self._pace_cache_path.read_text())
+
+        def inject_key(window):
+            window["note"] = "/Users/x/secret"
+
+        def inject_reason(window):
+            window["reason"] = "/Users/x/secret"
+
+        def long_reason(window):
+            window["reason"] = "only 1 comparable turns; needs 20" + "x" * 300
+
+        def negative_ratio(window):
+            window["pace_ratio"] = -1.5
+
+        def negative_count(window):
+            window["a_samples"] = -3
+
+        def absurd_ratio(window):
+            window["ci_high"] = 1e300
+
+        def missing_key(window):
+            window.pop("reason")
+
+        for corrupt in (inject_key, inject_reason, long_reason, negative_ratio,
+                        negative_count, absurd_ratio, missing_key):
+            with self.subTest(corruption=corrupt.__name__):
+                payload = json.loads(json.dumps(stored))
+                for entry in payload["pairs"]:
+                    corrupt(entry["windows"]["7"])
+                self._pace_cache_path.write_text(json.dumps(payload))
+                self._drop_pace_memory()
+                result = meter.matched_pace_windows(groups, now_ts=now)
+                self.assertEqual(result, expected)
+                self.assertNotIn("/Users/x/secret", json.dumps(result))
+                self.assertNotIn("note", json.dumps(result))
+
+    def test_matched_pace_over_cap_rebuilds_do_not_rewrite_the_cache(self):
+        now = datetime.datetime(2026, 8, 11, 12, 0, 0).timestamp()
+        groups = self._pace_groups(now, names=("alpha", "beta", "gamma", "delta"))
+        with mock.patch.object(meter, "MATCHED_PACE_CACHE_MAX_PAIRS", 2):
+            first = meter.matched_pace_windows(groups, now_ts=now)
+            kept = set(meter._matched_pace_pair_cache)
+            with mock.patch.object(meter, "atomic_write_text") as write:
+                for _ in range(3):
+                    meter._matched_pace_cache["signature"] = None
+                    again = meter.matched_pace_windows(groups, now_ts=now)
+                    self.assertEqual(again, first)
+            write.assert_not_called()
+            self.assertEqual(set(meter._matched_pace_pair_cache), kept)
+            self.assertEqual(first, self._cold_pace(groups, now))
+
+    def test_matched_pace_concurrent_callers_trigger_one_build(self):
+        now = datetime.datetime(2026, 8, 11, 12, 0, 0).timestamp()
+        groups = self._pace_groups(now)
+        callers = 4
+        waiting = set()
+        waiting_lock = threading.Lock()
+        all_waiting = threading.Event()
+
+        class CountingCondition(type(meter._matched_pace_build_condition)):
+            def wait(self, timeout=None):
+                with waiting_lock:
+                    waiting.add(threading.get_ident())
+                    if len(waiting) >= callers - 1:
+                        all_waiting.set()
+                return super().wait(timeout)
+
+        real_build = meter._build_matched_pace_windows
+        builds = []
+
+        def gated_build(*args, **kwargs):
+            builds.append(threading.get_ident())
+            all_waiting.wait(timeout=10)
+            return real_build(*args, **kwargs)
+
+        results = [None] * callers
+
+        def call(index):
+            results[index] = meter.matched_pace_windows(groups, now_ts=now)
+
+        with mock.patch.object(meter, "_matched_pace_build_condition",
+                               CountingCondition(threading.Lock())), \
+                mock.patch.object(meter, "_build_matched_pace_windows",
+                                  side_effect=gated_build):
+            threads = [threading.Thread(target=call, args=(index,), daemon=True)
+                       for index in range(callers)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=15)
+
+        self.assertTrue(all_waiting.is_set())
+        self.assertEqual(len(builds), 1)
+        self.assertTrue(all(result is not None for result in results))
+        self.assertTrue(all(result == results[0] for result in results))
+
     def test_matched_pace_reports_ratio_confidence_and_coverage(self):
         def sample(duration, ts):
             return {

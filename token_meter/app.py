@@ -7038,26 +7038,59 @@ _MATCHED_PACE_INT_FIELDS = ("a_samples", "b_samples", "matched_pairs")
 _MATCHED_PACE_FLOAT_FIELDS = ("coverage", "pace_ratio", "ci_low", "ci_high")
 
 
+_MATCHED_PACE_COMPARISON_KEYS = frozenset(
+    ("a_id", "b_id", "available", "reason")
+    + _MATCHED_PACE_INT_FIELDS + _MATCHED_PACE_FLOAT_FIELDS
+)
+# Stored numbers outside these bounds are corrupt; the pair is recomputed.
+_MATCHED_PACE_MAX_COUNT = 10 ** 9
+_MATCHED_PACE_MAX_RATIO = 1e15
+_MATCHED_PACE_MAX_REASON = 200
+# Every reason string matched_pace_comparison can produce.
+_MATCHED_PACE_REASON_RE = re.compile(
+    r"|needs \d{1,9} timed turns per runtime"
+    r"|only \d{1,9} comparable turns; needs \d{1,9}"
+    r"|only \d{1,9}% of the smaller history overlaps"
+)
+
+
 def _valid_matched_pace_comparison(value, a_id, b_id):
-    """Return True when a stored comparison has the exact builder shape."""
-    if not isinstance(value, dict):
-        return False
-    if value.get("a_id") != a_id or value.get("b_id") != b_id:
-        return False
+    """Return a rebuilt comparison with exactly the builder keys, else None.
+
+    Never raises: magnitude checks run before any float conversion, so a huge
+    JSON integer cannot overflow. Unknown keys reject the comparison so stored
+    content can never reach API output beyond the builder's own fields.
+    """
+    if not isinstance(value, dict) or set(value) != _MATCHED_PACE_COMPARISON_KEYS:
+        return None
+    if value["a_id"] != a_id or value["b_id"] != b_id:
+        return None
     for field in _MATCHED_PACE_INT_FIELDS:
-        number = value.get(field)
-        if isinstance(number, bool) or not isinstance(number, int) or number < 0:
-            return False
+        number = value[field]
+        if (isinstance(number, bool) or not isinstance(number, int)
+                or not 0 <= number <= _MATCHED_PACE_MAX_COUNT):
+            return None
     for field in _MATCHED_PACE_FLOAT_FIELDS:
-        number = value.get(field)
-        if (isinstance(number, bool) or not isinstance(number, (int, float))
-                or not math.isfinite(number)):
-            return False
-    if not isinstance(value.get("available"), bool):
-        return False
-    if "reason" in value and not isinstance(value["reason"], str):
-        return False
-    return True
+        number = value[field]
+        if isinstance(number, bool) or not isinstance(number, (int, float)):
+            return None
+        # Chained comparison is exact for ints of any size and rejects NaN.
+        if not 0 <= number <= _MATCHED_PACE_MAX_RATIO:
+            return None
+        if isinstance(number, float) and not math.isfinite(number):
+            return None
+    if not 0 <= value["coverage"] <= 1:
+        return None
+    if not isinstance(value["available"], bool):
+        return None
+    reason = value["reason"]
+    if (not isinstance(reason, str) or len(reason) > _MATCHED_PACE_MAX_REASON
+            or not _MATCHED_PACE_REASON_RE.fullmatch(reason)):
+        return None
+    return {key: value[key] for key in (
+        "a_id", "b_id", "a_samples", "b_samples", "matched_pairs", "coverage",
+        "pace_ratio", "ci_low", "ci_high", "available", "reason",
+    )}
 
 
 def _valid_matched_pace_entry(entry):
@@ -7071,10 +7104,13 @@ def _valid_matched_pace_entry(entry):
         return None
     if set(windows) != set(MATCHED_PACE_WINDOW_KEYS):
         return None
-    if not all(_valid_matched_pace_comparison(windows[window], a_id, b_id)
-               for window in MATCHED_PACE_WINDOW_KEYS):
-        return None
-    return (a_id, b_id), {"signature": signature, "windows": windows}
+    rebuilt = {}
+    for window in MATCHED_PACE_WINDOW_KEYS:
+        comparison = _valid_matched_pace_comparison(windows[window], a_id, b_id)
+        if comparison is None:
+            return None
+        rebuilt[window] = comparison
+    return (a_id, b_id), {"signature": signature, "windows": rebuilt}
 
 
 def _ensure_matched_pace_cache_loaded():
@@ -7102,7 +7138,11 @@ def _ensure_matched_pace_cache_loaded():
     for entry in pairs:
         if len(_matched_pace_pair_cache) >= MATCHED_PACE_CACHE_MAX_PAIRS:
             break
-        valid = _valid_matched_pace_entry(entry)
+        try:
+            valid = _valid_matched_pace_entry(entry)
+        except (OverflowError, TypeError, ValueError, RecursionError):
+            # Defense in depth: one malformed entry is skipped, never fatal.
+            valid = None
         if valid is not None:
             _matched_pace_pair_cache[valid[0]] = valid[1]
 
@@ -7124,7 +7164,7 @@ def _save_matched_pace_pair_cache():
             "windows": cached.get("windows"),
         }
         for pair_key, cached in _matched_pace_pair_cache.items()
-    ][:MATCHED_PACE_CACHE_MAX_PAIRS]
+    ]
     try:
         atomic_write_text(
             TOKEN_METER_MATCHED_PACE_CACHE,
@@ -7169,11 +7209,18 @@ def _build_matched_pace_windows(sample_groups, today, signature_fields, pair_cac
         id_signatures[runtime_id] = _pace_samples_signature(
             sample_groups[runtime_id], signature_fields,
         )
-    live_pairs = set()
+    live_pairs = {
+        (a_id, b_id)
+        for a_index, a_id in enumerate(ids) for b_id in ids[a_index + 1:]
+    }
+    # Drop pairs that no longer exist before admitting new ones, so the freed
+    # room is usable in this same build.
+    for stale_key in set(pair_cache) - live_pairs:
+        del pair_cache[stale_key]
+        changed = True
     for a_index, a_id in enumerate(ids):
         for b_id in ids[a_index + 1:]:
             pair_key = (a_id, b_id)
-            live_pairs.add(pair_key)
             # Windows are cut relative to today, so the day is part of the key:
             # a cached pair from a previous day must never be reused.
             pair_signature = (
@@ -7196,20 +7243,23 @@ def _build_matched_pace_windows(sample_groups, today, signature_fields, pair_cac
                     )
                     for window in rules
                 }
-                pair_cache[pair_key] = {
-                    "signature": pair_signature,
-                    "windows": per_window,
-                }
-                changed = True
+                # Bound memory and the persisted file. A cached pair is always
+                # refreshed in place; a new pair is admitted only while there
+                # is room. Pairs beyond the cap are still reported, simply
+                # recomputed on the next build, and never evict cached pairs,
+                # so an unchanged over-cap history causes no rewrite.
+                if (cached is not None
+                        or len(pair_cache) < MATCHED_PACE_CACHE_MAX_PAIRS):
+                    pair_cache[pair_key] = {
+                        "signature": pair_signature,
+                        "windows": per_window,
+                    }
+                    changed = True
             for window in rules:
                 result[window].append(per_window[window])
-    for stale_key in set(pair_cache) - live_pairs:
-        del pair_cache[stale_key]
-        changed = True
-    # Bound memory and the persisted file. Pairs beyond the cap are still
-    # reported; they are simply recomputed on the next build.
+    # Only a lowered cap can leave the cache oversized; trim the oldest once.
     while len(pair_cache) > MATCHED_PACE_CACHE_MAX_PAIRS:
-        del pair_cache[next(reversed(pair_cache))]
+        del pair_cache[next(iter(pair_cache))]
         changed = True
     data = {
         "method": "nearest workload match on context, input, output, cache, model calls, tools, and recency",
