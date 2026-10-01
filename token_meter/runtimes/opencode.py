@@ -41,8 +41,6 @@ SUMMARY_MESSAGE_LIMIT = 500
 # Bound for walking session.parent_id chains. Real nesting is shallow; the bound
 # keeps a malformed or cyclic chain from costing more than a few lookups.
 MAX_SESSION_ANCESTRY = 32
-# Relative tolerance used when deciding whether a parent's reported cost already
-# includes its children's cost.
 
 
 def _compact_text(value, limit=90):

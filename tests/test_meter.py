@@ -6837,7 +6837,7 @@ console.log(JSON.stringify({available,unavailable:{text:element.textContent,clas
         session_cards = self.page.split("function renderCurrentSessions(state=LATEST){", 1)[1].split(
             "const currentSessionGrid=$('current-session-grid');", 1
         )[0]
-        self.assertIn("costValueHtml((costPartial?'≥':'')+money(row.cost)+(estimate?' est':''),costAvailable,false)", session_cards)
+        self.assertIn("costValueHtml((costPartial?'At least ':'')+money(row.cost)+(estimate?' est':''),costAvailable,false)", session_cards)
         self.assertIn("const costTipAttrs=costAvailable?'':costUnavailableAttrs();", session_cards)
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard JavaScript")
@@ -15005,6 +15005,27 @@ class MonthlyBudgetTests(unittest.TestCase):
         self.assertEqual(result["session"]["budget_usd"], 5)
         self.assertNotIn("default_session_budget_usd", result)
         self.assertNotIn("session_budget_overrides", result)
+        self.assertNotIn("lower bound", result["caveat"])
+
+    def test_agent_budget_caveat_marks_partial_family_spend_as_lower_bound(self):
+        source = {"id": "ses_root", "provider": "opencode", "client": "OpenCode"}
+        state = {"total_cost": 1.0, "availability": {"cost": True}}
+        family = [
+            {"id": "ses_root", "provider": "opencode", "cost": 1.0,
+             "availability": {"cost": True}},
+            {"id": "ses_child", "provider": "opencode", "cost": 0.0,
+             "is_child_session": True, "root_session_id": "ses_root",
+             "availability": {"cost": False}},
+        ]
+        settings = meter.normalize_budget_settings({})
+        with mock.patch.object(meter, "resolve_agent_source", return_value=(source, "explicit")), \
+                mock.patch.object(meter, "recompute", return_value=state), \
+                mock.patch.object(meter, "budget_settings", return_value=settings), \
+                mock.patch.dict(meter._xsess, {"sessions": family}):
+            result = meter.agent_budget(session_id="ses_root")
+
+        self.assertTrue(result["session"]["cost_partial"])
+        self.assertIn("Spend is a lower bound", result["caveat"])
 
     def test_session_override_compare_and_set_rejects_a_stale_budget(self):
         """A delayed agent must not silently replace a newer session cap."""
@@ -16766,8 +16787,60 @@ class OpenCodeSubagentDashboardContractTests(unittest.TestCase):
 
     def test_current_session_card_marks_partial_family_cost_as_lower_bound(self):
         self.assertIn("const costPartial=costAvailable&&!!row.cost_partial;", self.page)
-        self.assertIn("(costPartial?'≥':'')+money(row.cost)", self.page)
-        self.assertIn("Cost is a lower bound: some subagent runs have no cost evidence.", self.page)
+        self.assertIn("(costPartial?'At least ':'')+money(row.cost)", self.page)
+        self.assertNotIn("(costPartial?'≥':'')", self.page)
+        self.assertIn(
+            "Cost is a lower bound: some runs in this session family have no cost evidence.",
+            self.page,
+        )
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard JavaScript")
+    def test_session_cap_display_and_alert_use_family_spend(self):
+        """An OpenCode family cap reports and alerts on root plus child spend."""
+        page_path = Path(__file__).resolve().parents[1].joinpath("page.html")
+        script = f"""
+const fs=require('fs');
+const page=fs.readFileSync({json.dumps(str(page_path))},'utf8');
+function extract(name){{let start=page.indexOf(`function ${{name}}(`);if(start<0)throw Error(`missing ${{name}}`);let i=page.indexOf('{{',start),depth=0;for(;i<page.length;i++){{if(page[i]==='{{')depth++;else if(page[i]==='}}'&&--depth===0)return page.slice(start,i+1);}}throw Error(`unclosed ${{name}}`);}}
+const metricAvailable=(row,metric)=>row?.availability?.[metric]!==false,money=n=>'$'+Number(n).toFixed(2);
+const nodes={{}},el=id=>nodes[id]||(nodes[id]={{value:'',max:'',min:'0.5',textContent:'',style:{{setProperty(){{}}}}}});
+const $=el,defaultSessionBudget=10,SESSION_BUDGET_SLIDER_MIN=0.5,SESSION_BUDGET_SLIDER_BASE_MAX=50,formatBudgetInput=n=>String(n);
+let cap=10;const dollarInputValue=()=>cap;
+eval(extract('sessionCapSpend'));
+eval(extract('sessionBudgetSliderMax'));
+eval(extract('syncSessionBudgetControls'));
+eval(extract('sessionAlert'));
+const family=(partial,rootAvailable=true)=>({{provider:'opencode',source:{{id:'ses_root'}},total_cost:1,availability:{{cost:rootAvailable}},
+ session_budget:{{id:'ses_root',budget_usd:10,spend_usd:10.5,cost_available:true,cost_partial:partial}}}});
+const out={{}};
+const complete=family(false);syncSessionBudgetControls(10,complete);
+out.familySpend=el('session-budget-spend').textContent;out.familyAlert=sessionAlert(complete);
+const partial=family(true,false);syncSessionBudgetControls(10,partial);
+out.partialSpend=el('session-budget-spend').textContent;out.partialAlert=sessionAlert(partial);
+const claude={{provider:'claude',source:{{id:'c1'}},total_cost:1,availability:{{cost:true}},
+ session_budget:{{id:'c1',budget_usd:10,spend_usd:1,cost_available:true}}}};
+syncSessionBudgetControls(10,claude);out.claudeSpend=el('session-budget-spend').textContent;out.claudeAlert=sessionAlert(claude);
+const claudeOver={{...claude,total_cost:12,session_budget:undefined}};out.claudeOverAlert=sessionAlert(claudeOver);
+const unmeasured={{...claude,availability:{{cost:false}}}};syncSessionBudgetControls(10,unmeasured);
+out.unmeasuredSpend=el('session-budget-spend').textContent;out.unmeasuredAlert=sessionAlert(unmeasured);
+process.stdout.write(JSON.stringify(out));
+"""
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        out = json.loads(completed.stdout)
+        self.assertEqual(out["familySpend"], "Session spend $10.50")
+        self.assertEqual(out["familyAlert"]["type"], "budget")
+        self.assertEqual(out["familyAlert"]["current"], 10.5)
+        self.assertIn("now $10.50", out["familyAlert"]["msg"])
+        # A measured lower bound is still available and is labeled as such.
+        self.assertEqual(out["partialSpend"], "Session spend at least $10.50")
+        self.assertIn("now at least $10.50", out["partialAlert"]["msg"])
+        # Sessions without a folded family keep their own-cost behavior.
+        self.assertEqual(out["claudeSpend"], "Session spend $1.00")
+        self.assertEqual(out["claudeAlert"]["msg"], "")
+        self.assertIn("now $12.00", out["claudeOverAlert"]["msg"])
+        self.assertEqual(out["unmeasuredSpend"], "Session spend unavailable")
+        self.assertEqual(out["unmeasuredAlert"]["msg"], "")
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard JavaScript")
     def test_all_sessions_view_counts_children_and_respects_filters(self):

@@ -261,6 +261,14 @@ class FoldedChildAvailabilityTests(unittest.TestCase):
         self.assertEqual(unmeasured["cost"], 0)
         self.assertFalse(unmeasured["cost_partial"])
 
+    def test_current_row_without_folded_children_has_no_partial_flag(self):
+        claude = {**session("solo", "Claude", "model-a", 1.0, 10, mtime=95),
+                  "provider": "claude"}
+        summary = current_session_summaries([claude], now=100)[0]
+        self.assertNotIn("cost_partial", summary)
+        folded = current_session_summaries(self.family(True, True), now=100)[0]
+        self.assertFalse(folded["cost_partial"])
+
 
 if __name__ == "__main__":
     unittest.main()

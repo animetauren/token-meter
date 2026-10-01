@@ -2927,6 +2927,16 @@ function sessionBudgetForSession(s){
  return defaultSessionBudget;
 }
 function sessionBudgetSource(s){return s?.session_budget?.source||'legacy';}
+// A session family (root plus child runs) shares one cap; the server reports
+// its combined spend, which is a lower bound when any member lacks evidence.
+function sessionCapSpend(s){
+ const b=s?.session_budget;
+ if(b&&Object.prototype.hasOwnProperty.call(b,'cost_partial')){
+  const spend=Number(b.spend_usd),available=b.cost_available!==false&&b.spend_usd!=null&&Number.isFinite(spend);
+  return {available,spend:available?spend:0,partial:available&&!!b.cost_partial};
+ }
+ return {available:metricAvailable(s||{},'cost'),spend:Number(s?.total_cost)||0,partial:false};
+}
 async function persistSessionBudget(s,value,{migrating=false}={}){
  const sessionId=budgetSessionKey(s),response=await fetch('/settings/session-budget',{method:'POST',headers:{'Content-Type':'application/json','X-Token-Meter-Action':agentActionToken()},body:JSON.stringify({session_id:sessionId,budget_usd:value})});
  const result=await response.json();
@@ -2961,7 +2971,7 @@ function migrateLegacySessionBudget(s){
  queueSessionBudget(s,legacy,{migrating:true}).then(()=>{if(s===CURRENT)syncSessionBudgetControls(sessionBudgetForSession(s),s);}).catch(()=>{});
 }
 function sessionBudgetSliderMax(s,value){
- const reference=Math.max(defaultSessionBudget,Number(value)||0,Number(s?.total_cost)||0);
+ const reference=Math.max(defaultSessionBudget,Number(value)||0,sessionCapSpend(s).spend);
  return Math.max(SESSION_BUDGET_SLIDER_BASE_MAX,Math.ceil(reference*1.5/10)*10);
 }
 function syncSessionBudgetControls(value,s=CURRENT){
@@ -2974,7 +2984,8 @@ function syncSessionBudgetControls(value,s=CURRENT){
  slider.style.setProperty('--budget-fill',`${Math.max(0,Math.min(100,100*(Number(slider.value)-min)/(max-min||1)))}%`);
   $('budget-slider-min').textContent=`$${min.toFixed(2)}`;
  $('budget-slider-max').textContent=money(max);
- $('session-budget-spend').textContent=metricAvailable(s||{},'cost')?`Session spend ${money(s?.total_cost||0)}${s?.cost_approx?' est':''}`:'Session spend unavailable';
+ const capSpend=sessionCapSpend(s);
+ $('session-budget-spend').textContent=capSpend.available?`Session spend ${capSpend.partial?'at least ':''}${money(capSpend.spend)}${s?.cost_approx?' est':''}`:'Session spend unavailable';
 }
 function loadBudgetForSession(s){
  syncSessionBudgetControls(sessionBudgetForSession(s),s);
@@ -3009,7 +3020,7 @@ function extendBudget(){
  if(!CURRENT) return;
  const add=parseFloat($('budget-add').value);
  if(!Number.isFinite(add)||add<=0){ setNotifyState('Enter a positive budget amount.'); return; }
- const currentCost=+(CURRENT.total_cost||0);
+ const currentCost=sessionCapSpend(CURRENT).spend;
  const currentCap=dollarInputValue('budget',0);
  const next=setBudgetCap(Math.max(currentCap,currentCost)+add);
  setNotifyState('Budget raised to '+money(next)+'.');
@@ -3749,11 +3760,11 @@ function renderCurrentOptimization(s){
   : 'no unused user-installed packs in this run';
 }
 function sessionAlert(s){
- const source=s.source||{};
- if(!metricAvailable(s,'cost'))return {type:'',msg:'',key:''};
+ const source=s.source||{},capSpend=sessionCapSpend(s);
+ if(!capSpend.available)return {type:'',msg:'',key:''};
  if(s.provider==='cursor')return {type:'',msg:'',key:''};
  const budget=dollarInputValue('budget',10);
- if(s.total_cost>budget) return {type:'budget',msg:`This session passed your ${money(budget)} cap - now ${money(s.total_cost)}`,key:`${source.id||s.session}:budget:${budget}`,budget,current:s.total_cost};
+ if(capSpend.spend>budget) return {type:'budget',msg:`This session passed your ${money(budget)} cap - now ${capSpend.partial?'at least ':''}${money(capSpend.spend)}`,key:`${source.id||s.session}:budget:${budget}`,budget,current:capSpend.spend};
  return {type:'',msg:'',key:''};
 }
 function notifyAlertForSession(s,opts={}){
@@ -3912,7 +3923,7 @@ function renderCurrentRun(s){
 	 const source=s.source||{},throughput=sessionDisplayThroughput(s),wait=s.wait_time||{},context=s.context||{},tools=s.tools||{},cache=s.cache||{},timing=s.timing||{};
  const costAvailable=metricAvailable(s,'cost'),cacheAvailable=metricAvailable(s,'cache'),throughputAvailable=metricAvailable(s,'throughput'),cacheSavingsAvailable=costAvailable&&cacheAvailable&&cache.savings_available!==false;
  const contextPct=Math.max(0,Math.min(1,Number(context.latest_pct)||0)),toolResultTokens=tools.total_output_tokens||0;
- const alert=sessionAlert(s),frozen=!!s.ended,cursorEstimate=s.provider==='cursor',cap=dollarInputValue('budget',Infinity),costPerTask=s.analyses?.cost_per_task||{};
+ const alert=sessionAlert(s),capSpend=sessionCapSpend(s),frozen=!!s.ended,cursorEstimate=s.provider==='cursor',cap=dollarInputValue('budget',Infinity),costPerTask=s.analyses?.cost_per_task||{};
  $('preview-provider').innerHTML=runtimeBadgeContent(s,source.label||s.provider||'source');
  $('preview-provider').className='badge app '+appBadgeClass(s);
  $('preview-project').textContent=s.project||source.project||'';
@@ -3921,7 +3932,7 @@ function renderCurrentRun(s){
  $('preview-state').textContent=pinned?'Pinned':(frozen?'Complete':'Live');
  $('preview-idle').textContent=frozen?'frozen':idleLabel(s.idle_s);
  setCostValue('preview-cost',money(s.total_cost)+(s.cost_approx?' est':''),costAvailable);
- $('preview-cost-note').textContent=alert.msg?alert.msg:(costAvailable&&Number.isFinite(cap)?`${money(Math.max(0,cap-(s.total_cost||0)))} before the ${money(cap)} session cap`:source.pricing_note||'Cost evidence unavailable.');
+ $('preview-cost-note').textContent=alert.msg?alert.msg:(capSpend.available&&Number.isFinite(cap)?`${capSpend.partial?'At most ':''}${money(Math.max(0,cap-capSpend.spend))} before the ${money(cap)} session cap`:source.pricing_note||'Cost evidence unavailable.');
  $('preview-status-card').classList.toggle('warn',!!alert.msg);
  $('preview-context-pct').textContent=context.window?pct(contextPct):'--';
  $('preview-context-bar').setAttribute('aria-valuenow',String(Math.round(contextPct*100)));
@@ -7513,7 +7524,7 @@ function renderCurrentSessions(state=LATEST){
   const estimate=row.cost_approx||['local_estimate','mixed'].includes(row.usage_basis);
   // A folded family with an unmeasured member reports a lower bound.
   const costPartial=costAvailable&&!!row.cost_partial;
-  const cost=costValueHtml((costPartial?'≥':'')+money(row.cost)+(estimate?' est':''),costAvailable,false);
+  const cost=costValueHtml((costPartial?'At least ':'')+money(row.cost)+(estimate?' est':''),costAvailable,false);
   const costTipAttrs=costAvailable?'':costUnavailableAttrs();
   const outputPerDollar=row.output_per_dollar==null?'--':compactNumber(row.output_per_dollar);
   const context=currentSessionContext(row);
@@ -7525,7 +7536,7 @@ function renderCurrentSessions(state=LATEST){
   const speed=speedAvailable?`${speedFmt(throughput.output_tps)} tok/s${row.token_estimate?' est':''}`:'--';
   const contextSpark=currentSessionContextSparkline(row);
   const outputDollarDescription=row.output_per_dollar==null?'Output per dollar unavailable.':`${compactNumber(row.output_per_dollar)} output tokens per covered dollar.`;
-  const cardDescription=`${contextSpark.summary} ${outputDollarDescription}${costPartial?' Cost is a lower bound: some subagent runs have no cost evidence.':''} Drag to reorder. Press ⌥ and an arrow key to move.`;
+  const cardDescription=`${contextSpark.summary} ${outputDollarDescription}${costPartial?' Cost is a lower bound: some runs in this session family have no cost evidence.':''} Drag to reorder. Press ⌥ and an arrow key to move.`;
   const arriving=arrivingIds.has(String(row.id))?' is-arriving':'';
   return `<button class="card currentSessionCard provider-${esc(provider)} activity-${activity}${arriving}${costAvailable?'':' fieldtip'}" style="--harness:${esc(runtimeHarness(row))}" type=button draggable=true data-current-session-id="${esc(row.id)}" aria-label="${esc(`Open ${sessionName}`)}" aria-description="${esc(cardDescription)}" aria-keyshortcuts="Alt+ArrowLeft Alt+ArrowRight Alt+ArrowUp Alt+ArrowDown" ${costTipAttrs}><div class=currentSessionTop><div class=currentSessionRuntime>${runtimeMarkSvg(row)}<span>${esc(runtimeLine)}</span></div><div class="currentSessionStatus ${activity}">${activityLabel}</div></div><div class=currentSessionIdentity><h3>${esc(sessionName)}</h3><p>${esc(row.project||'No project')}</p></div><div class=currentSessionMetrics><div class=currentSessionMetric><span>Cost</span><b class=mono>${cost}</b></div><div class=currentSessionMetric><span>Output / $</span><b class=mono>${esc(outputPerDollar)}</b></div><div class=currentSessionMetric><span>Context in use</span><div class=currentSessionContextValue><b class=mono>${esc(context)}</b>${contextSpark.html}</div></div><div class=currentSessionMetric><span>Speed</span><b class=mono>${esc(speed)}</b></div></div><div class=currentSessionFoot><span class=currentSessionMove><svg class=currentSessionGrip viewBox="0 0 12 16" aria-hidden=true><circle cx="3" cy="3" r="1.2"/><circle cx="9" cy="3" r="1.2"/><circle cx="3" cy="8" r="1.2"/><circle cx="9" cy="8" r="1.2"/><circle cx="3" cy="13" r="1.2"/><circle cx="9" cy="13" r="1.2"/></svg>${currentSessionAge(row)}</span></div></button>`;
  }).join(''):(filterView.activitySelection==='all'?currentSessionsEmptyHtml(state?.xsession):currentSessionsFilteredEmptyHtml(filterView.activitySelection));

@@ -8321,7 +8321,10 @@ def agent_budget(session_id=None, caller=None):
         "answer": "Session budget is available for this run.",
         "evidence": [],
         "recommended_action": "Use the remaining session budget when deciding whether to continue or narrow scope.",
-        "caveat": "Spend is an estimate when this runtime uses public API rates.",
+        "caveat": "Spend is an estimate when this runtime uses public API rates." + (
+            " Spend is a lower bound: some runs in this session family have no cost evidence."
+            if session.get("cost_partial") else ""
+        ),
         "dashboard_url": agent_dashboard_url(source.get("id"), "summary"),
         "as_of": agent_as_of(),
         "data_scope": "session_budget",

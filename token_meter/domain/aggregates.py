@@ -419,7 +419,9 @@ def current_session_summaries(rows, now=None, max_age_s=30 * 60, limit=8,
             "cost": float(row.get("cost") or 0),
             "output_per_dollar": output_per_dollar,
             "cost_approx": bool(row.get("cost_approx")),
-            "cost_partial": bool(row.get("cost_partial")),
+            # Only rows that folded child runs carry a lower-bound flag.
+            **({"cost_partial": bool(row.get("cost_partial"))}
+               if "cost_partial" in row else {}),
             "availability": {
                 "cost": availability.get("cost") is not False,
                 "context": availability.get("context") is not False,
