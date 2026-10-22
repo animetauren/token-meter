@@ -5472,6 +5472,8 @@ def cache_savings(tot, provider, model, executions=None):
                 "output_tokens": int(tokens.get("output", 0) or 0),
             }
             quote, _ = _resolved_price_quote(execution_model, provider, variant, at=at)
+            if not quote.available:
+                return None
             p = quote.to_legacy_price() or ZERO_PRICE
             input_multiplier, _ = _price_multipliers(
                 usage, quote.matched_rule or execution_model, provider, at,
@@ -5483,7 +5485,10 @@ def cache_savings(tot, provider, model, executions=None):
                 input_multiplier=input_multiplier,
             )
         return saved
-    p, _ = price_for(model, provider)
+    quote, _ = _resolved_price_quote(model, provider, at=None)
+    if not quote.available:
+        return None if int(tot.get("cache_read", 0) or 0) else 0.0
+    p = quote.to_legacy_price() or ZERO_PRICE
     return _domain_cache_savings_for_rate(
         tot["cache_read"], p["input"], p["cache_read"]
     )
@@ -5498,19 +5503,23 @@ def cache_block(tot, cost, executions, provider, model, savings_available=True):
     latest_cache = int(latest_tokens.get("cache", 0) or 0)
     latest_read = int(latest_tokens.get("cache_read", latest_cache) or 0)
     latest_write = int(latest_tokens.get("cache_write", 0) or 0)
+    saved = (
+        cache_savings(tot, provider, model, executions)
+        if savings_available else None
+    )
     result = _domain_cache_metrics(
         fresh=fresh,
         read=read,
         write=write,
         read_cost=cost.get("cache_read", 0.0),
         write_cost=cost.get("cache_write", 0.0),
-        saved=cache_savings(tot, provider, model, executions) if savings_available else 0.0,
+        saved=saved or 0.0,
         latest_input=latest_input,
         latest_cache=latest_cache,
         latest_read=latest_read,
         latest_write=latest_write,
     )
-    result["savings_available"] = bool(savings_available)
+    result["savings_available"] = bool(savings_available and saved is not None)
     for target, source in (
         ("write_5m", "cache_write_5m"),
         ("write_1h", "cache_write_1h"),
@@ -5525,7 +5534,7 @@ def cache_block(tot, cost, executions, provider, model, savings_available=True):
     ):
         if source in latest_tokens:
             result["latest"][target] = int(latest_tokens.get(source) or 0)
-    if not savings_available:
+    if not result["savings_available"]:
         result["saved"] = None
     return result
 

@@ -19305,19 +19305,67 @@ class OpenCodeTests(unittest.TestCase):
         return conn
 
     def _session_row(self, sid, directory, title, model, cost, inp, out, rea, cr, cw,
-                     updated, parent_id=None, archived=None, agent="build"):
+                     updated, parent_id=None, archived=None, agent="build",
+                     provider_id="opencode-go"):
         return {
             "id": sid, "project_id": "proj", "parent_id": parent_id, "slug": sid,
             "directory": directory, "title": title, "version": "1.18.14",
             "time_created": updated - 1000, "time_updated": updated,
             "time_archived": archived, "agent": agent,
-            "model": json.dumps({"id": model, "providerID": "opencode-go", "variant": "high"}),
+            "model": json.dumps({"id": model, "providerID": provider_id, "variant": "high"}),
             "cost": cost, "tokens_input": inp, "tokens_output": out,
             "tokens_reasoning": rea, "tokens_cache_read": cr, "tokens_cache_write": cw,
         }
 
     def _message(self, mid, sid, data, created):
         return (mid, sid, created, created, json.dumps(data))
+
+    def _pricing_state(self, root, model, provider_id, cache_read=5000,
+                       prices=None):
+        root = Path(root)
+        base = 1_784_548_900_000
+        conn = self._build_db(root)
+        row = self._session_row("ses_priced", "/repo", "Priced", model,
+                                0.0123, 1000, 200, 0, cache_read, 0,
+                                base, provider_id=provider_id)
+        conn.execute("INSERT INTO session VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     tuple(row.values()))
+        conn.execute("INSERT INTO message VALUES (?,?,?,?,?)", (
+            "msg_priced", "ses_priced", base, base + 500, json.dumps({
+                "role": "assistant", "modelID": model, "providerID": provider_id,
+                "time": {"created": base, "completed": base + 500},
+                "tokens": {"input": 1000, "output": 200, "reasoning": 0,
+                           "cache": {"read": cache_read, "write": 0}},
+                "cost": 0.0123, "finish": "stop",
+            }),
+        ))
+        conn.commit()
+        conn.close()
+        settings = Path(root) / "settings.json"
+        settings.write_text(json.dumps({"model_pricing": prices or {}}))
+        with mock.patch.object(meter, "OPENCODE_DB", str(root / "opencode.db")), \
+                mock.patch.object(meter, "TOKEN_METER_SETTINGS", str(settings)), \
+                mock.patch.object(meter, "_opencode_native_adapters", {}):
+            source = meter.opencode_session_sources()[0]
+            return meter.recompute_opencode(source)
+
+    def test_unpriced_opencode_models_report_unavailable_cache_savings(self):
+        for model, provider_id in (
+            ("mystery-model-9", "unknown-provider"),
+            ("claude-opus-4-8", "opencode"),
+            ("claude-opus-4-8", "opencode-go"),
+        ):
+            with self.subTest(model=model, provider_id=provider_id), \
+                    tempfile.TemporaryDirectory() as tmp:
+                state = self._pricing_state(tmp, model, provider_id)
+
+            self.assertAlmostEqual(state["total_cost"], 0.0123)
+            self.assertIsNone(state["cache"]["saved"])
+            self.assertFalse(state["cache"]["savings_available"])
+            self.assertIsNone(state["cache_saved"])
+            self.assertNotIn(
+                "cache-saved", {row.get("key") for row in state["insights"]},
+            )
 
     def test_discovery_labels_roots_and_child_sessions_and_filters_archived(self):
         with tempfile.TemporaryDirectory() as tmp:
