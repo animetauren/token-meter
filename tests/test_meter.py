@@ -19391,6 +19391,14 @@ class OpenCodeTests(unittest.TestCase):
             self.assertTrue(state["cache"]["savings_available"])
             self.assertAlmostEqual(state["cache"]["saved"], 0.045)
 
+    def test_cursor_model_uses_cursor_rates_for_cache_savings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._pricing_state(tmp, "claude-opus-5-5", "cursor")
+
+        self.assertAlmostEqual(state["total_cost"], 0.0123)
+        self.assertTrue(state["cache"]["savings_available"])
+        self.assertAlmostEqual(state["cache"]["saved"], 0.019)
+
     def test_explicit_opencode_price_overrides_upstream_fallback(self):
         prices = {"opencode": {"claude-sonnet-4-6": {
             "input": 9.0, "output": 9.0, "cache_write": 9.0, "cache_read": 1.0,
