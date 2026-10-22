@@ -3691,7 +3691,33 @@ def price_quote(query, path=None):
     return quote
 
 
-def _resolved_price_quote(model, provider="claude", variant=None, at=None):
+# OpenCode message rows carry the upstream provider that served the model.
+# Only direct vendor identities may reuse that vendor's public catalog; the
+# OpenCode and OpenCode Go aggregators keep their own (possibly negotiated)
+# rates and never borrow a vendor price.
+OPENCODE_UPSTREAM_MODEL_PROVIDERS = {
+    "anthropic": "anthropic",
+    "openai": "openai",
+    "cursor": "cursor",
+}
+
+
+def _opencode_price_quote(model, model_provider=None, variant=None, at=None):
+    """Resolve an OpenCode estimate from its own rows, then a direct vendor."""
+
+    quote = price_quote(_price_query_from_compat("opencode", model, variant, at))
+    if quote.available:
+        return quote
+    upstream = OPENCODE_UPSTREAM_MODEL_PROVIDERS.get(
+        str(model_provider or "").strip().lower()
+    )
+    if upstream is None:
+        return quote
+    return price_quote(_price_query_from_compat(upstream, model, variant, at))
+
+
+def _resolved_price_quote(model, provider="claude", variant=None, at=None,
+                          model_provider=None):
     """Resolve compatibility estimates without borrowing another model's price."""
 
     if provider == "cursor":
@@ -3703,7 +3729,7 @@ def _resolved_price_quote(model, provider="claude", variant=None, at=None):
             str(variant or ""), 0.0, 0.0, 0.0, 0.0,
         ), True
     if provider == "opencode":
-        quote = price_quote(_price_query_from_compat("opencode", model, variant, at))
+        quote = _opencode_price_quote(model, model_provider, variant, at)
         if quote.available:
             return quote, False
         return quote, True
@@ -5272,6 +5298,7 @@ def build_state(source, tot, cost, total_tokens, total_cost, series, executions,
     cache = cache_block(
         tot, cost, executions, source["provider"], primary_model,
         savings_available=source.get("cache_savings_available") is not False,
+        model_provider=source.get("model_provider"),
     )
     tool_data = tool_summary(executions)
     model_identity = public_session_model_identity(source.get("model_identity"))
@@ -5454,7 +5481,7 @@ def enrich_insights(insights, executions, tool_data, context_window, context_lat
     )
 
 
-def cache_savings(tot, provider, model, executions=None):
+def cache_savings(tot, provider, model, executions=None, model_provider=None):
     if executions:
         saved = 0.0
         for execution in executions:
@@ -5471,7 +5498,12 @@ def cache_savings(tot, provider, model, executions=None):
                 "cache_read_input_tokens": cache_read,
                 "output_tokens": int(tokens.get("output", 0) or 0),
             }
-            quote, _ = _resolved_price_quote(execution_model, provider, variant, at=at)
+            quote, _ = _resolved_price_quote(
+                execution_model, provider, variant, at=at,
+                model_provider=(
+                    execution.get("model_provider") or model_provider
+                ),
+            )
             if not quote.available:
                 return None
             p = quote.to_legacy_price() or ZERO_PRICE
@@ -5485,7 +5517,9 @@ def cache_savings(tot, provider, model, executions=None):
                 input_multiplier=input_multiplier,
             )
         return saved
-    quote, _ = _resolved_price_quote(model, provider, at=None)
+    quote, _ = _resolved_price_quote(
+        model, provider, at=None, model_provider=model_provider,
+    )
     if not quote.available:
         return None if int(tot.get("cache_read", 0) or 0) else 0.0
     p = quote.to_legacy_price() or ZERO_PRICE
@@ -5494,7 +5528,8 @@ def cache_savings(tot, provider, model, executions=None):
     )
 
 
-def cache_block(tot, cost, executions, provider, model, savings_available=True):
+def cache_block(tot, cost, executions, provider, model, savings_available=True,
+                model_provider=None):
     fresh = int(tot.get("input", 0) or 0)
     read = int(tot.get("cache_read", 0) or 0)
     write = int(tot.get("cache_write", 0) or 0)
@@ -5504,7 +5539,9 @@ def cache_block(tot, cost, executions, provider, model, savings_available=True):
     latest_read = int(latest_tokens.get("cache_read", latest_cache) or 0)
     latest_write = int(latest_tokens.get("cache_write", 0) or 0)
     saved = (
-        cache_savings(tot, provider, model, executions)
+        cache_savings(
+            tot, provider, model, executions, model_provider=model_provider,
+        )
         if savings_available else None
     )
     result = _domain_cache_metrics(

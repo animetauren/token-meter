@@ -19349,6 +19349,31 @@ class OpenCodeTests(unittest.TestCase):
             source = meter.opencode_session_sources()[0]
             return meter.recompute_opencode(source)
 
+    def test_anthropic_model_uses_anthropic_rates_for_cache_savings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._pricing_state(tmp, "claude-sonnet-4-6", "anthropic")
+
+        self.assertEqual(state["executions"][0]["model_provider"], "anthropic")
+        self.assertAlmostEqual(state["total_cost"], 0.0123)
+        self.assertFalse(state["cost_approx"])
+        self.assertTrue(state["cache"]["savings_available"])
+        self.assertAlmostEqual(state["cache"]["saved"], 0.0135)
+        self.assertAlmostEqual(state["cache_saved"], 0.0135)
+        self.assertGreater(state["cache"]["cost"], 0)
+
+    def test_explicit_opencode_price_overrides_upstream_fallback(self):
+        prices = {"opencode": {"claude-sonnet-4-6": {
+            "input": 9.0, "output": 9.0, "cache_write": 9.0, "cache_read": 1.0,
+        }}}
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._pricing_state(
+                tmp, "claude-sonnet-4-6", "anthropic", prices=prices,
+            )
+
+        self.assertAlmostEqual(state["total_cost"], 0.0123)
+        self.assertTrue(state["cache"]["savings_available"])
+        self.assertAlmostEqual(state["cache"]["saved"], 0.04)
+
     def test_unpriced_opencode_models_report_unavailable_cache_savings(self):
         for model, provider_id in (
             ("mystery-model-9", "unknown-provider"),
