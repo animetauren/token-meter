@@ -19321,24 +19321,25 @@ class OpenCodeTests(unittest.TestCase):
         return (mid, sid, created, created, json.dumps(data))
 
     def _pricing_state(self, root, model, provider_id, cache_read=5000,
-                       prices=None):
+                       prices=None, cost=0.0123, messages=True):
         root = Path(root)
         base = 1_784_548_900_000
         conn = self._build_db(root)
         row = self._session_row("ses_priced", "/repo", "Priced", model,
-                                0.0123, 1000, 200, 0, cache_read, 0,
+                                cost, 1000, 200, 0, cache_read, 0,
                                 base, provider_id=provider_id)
         conn.execute("INSERT INTO session VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                      tuple(row.values()))
-        conn.execute("INSERT INTO message VALUES (?,?,?,?,?)", (
-            "msg_priced", "ses_priced", base, base + 500, json.dumps({
-                "role": "assistant", "modelID": model, "providerID": provider_id,
-                "time": {"created": base, "completed": base + 500},
-                "tokens": {"input": 1000, "output": 200, "reasoning": 0,
-                           "cache": {"read": cache_read, "write": 0}},
-                "cost": 0.0123, "finish": "stop",
-            }),
-        ))
+        if messages:
+            conn.execute("INSERT INTO message VALUES (?,?,?,?,?)", (
+                "msg_priced", "ses_priced", base, base + 500, json.dumps({
+                    "role": "assistant", "modelID": model, "providerID": provider_id,
+                    "time": {"created": base, "completed": base + 500},
+                    "tokens": {"input": 1000, "output": 200, "reasoning": 0,
+                               "cache": {"read": cache_read, "write": 0}},
+                    "cost": cost, "finish": "stop",
+                }),
+            ))
         conn.commit()
         conn.close()
         settings = Path(root) / "settings.json"
@@ -19360,6 +19361,26 @@ class OpenCodeTests(unittest.TestCase):
         self.assertAlmostEqual(state["cache"]["saved"], 0.0135)
         self.assertAlmostEqual(state["cache_saved"], 0.0135)
         self.assertGreater(state["cache"]["cost"], 0)
+
+    def test_cache_savings_use_session_provider_without_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._pricing_state(
+                tmp, "claude-sonnet-4-6", "anthropic", messages=False,
+            )
+
+        self.assertEqual(state["executions"], [])
+        self.assertTrue(state["cache"]["savings_available"])
+        self.assertAlmostEqual(state["cache"]["saved"], 0.0135)
+
+    def test_cost_unavailable_marks_cache_savings_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._pricing_state(
+                tmp, "claude-sonnet-4-6", "anthropic", cost=None,
+            )
+
+        self.assertFalse(state["availability"]["cost"])
+        self.assertFalse(state["cache"]["savings_available"])
+        self.assertIsNone(state["cache"]["saved"])
 
     def test_explicit_opencode_price_overrides_upstream_fallback(self):
         prices = {"opencode": {"claude-sonnet-4-6": {

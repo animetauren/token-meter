@@ -5355,6 +5355,7 @@ def build_state(source, tot, cost, total_tokens, total_cost, series, executions,
     if availability.get("cost") is False:
         for field in ("saved", "cost", "read_cost", "write_cost"):
             cache[field] = None
+        cache["savings_available"] = False
     cache["available"] = bool(availability.get("cache"))
     tool_data["results_available"] = bool(availability.get("tool_results"))
     insights = enrich_insights(insights, executions, tool_data, context_window, context_latest, context_peak,
