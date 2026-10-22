@@ -19382,6 +19382,15 @@ class OpenCodeTests(unittest.TestCase):
         self.assertFalse(state["cache"]["savings_available"])
         self.assertIsNone(state["cache"]["saved"])
 
+    def test_openai_model_uses_openai_rates_for_cache_savings(self):
+        for model in ("gpt-6-astra", "openai/gpt-6-astra"):
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as tmp:
+                state = self._pricing_state(tmp, model, "openai")
+
+            self.assertAlmostEqual(state["total_cost"], 0.0123)
+            self.assertTrue(state["cache"]["savings_available"])
+            self.assertAlmostEqual(state["cache"]["saved"], 0.045)
+
     def test_explicit_opencode_price_overrides_upstream_fallback(self):
         prices = {"opencode": {"claude-sonnet-4-6": {
             "input": 9.0, "output": 9.0, "cache_write": 9.0, "cache_read": 1.0,
@@ -19400,6 +19409,8 @@ class OpenCodeTests(unittest.TestCase):
             ("mystery-model-9", "unknown-provider"),
             ("claude-opus-4-8", "opencode"),
             ("claude-opus-4-8", "opencode-go"),
+            ("claude-opus-4-8", "openrouter"),
+            ("claude-opus-4-8", "amazon-bedrock"),
         ):
             with self.subTest(model=model, provider_id=provider_id), \
                     tempfile.TemporaryDirectory() as tmp:
